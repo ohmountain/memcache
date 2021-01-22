@@ -1,7 +1,8 @@
 package memcache
 
 type node struct {
-	value interface{}
-	prv   *node
-	nxt   *node
+	Key   string
+	Value interface{}
+	Prv   *node
+	Nxt   *node
 }
