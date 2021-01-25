@@ -160,6 +160,8 @@ func (m *memcache) Cap() uint {
 	return m.cap
 }
 
+/// 暂时忽略
+/// 还没有完整的控制机制
 func (m *memcache) shadow() shadow {
 	s := shadow{
 		Version: time.Now().Unix(),
