@@ -1,7 +1,7 @@
 package memcache
 
 import (
-	"io"
+	"time"
 )
 
 //
@@ -31,12 +31,6 @@ type memcache struct {
 	// 数据存储器，一个map
 	// 读取和写入的复杂度都为O(1)
 	holder map[string]*node
-
-	// 用于从reader里面恢复之前的存储
-	reader io.Reader
-
-	// 将当前的缓存状态写入到writer中
-	writer io.Writer
 }
 
 // 使用WithLRU策略的缓存器
@@ -60,9 +54,10 @@ func (m *memcache) Set(key string, value interface{}) {
 	// 最初一个缓存内容
 	if m.size == 0 {
 		ins := &node{
-			value: value,
-			prv:   nil,
-			nxt:   nil,
+			Key:   key,
+			Value: value,
+			Prv:   nil,
+			Nxt:   nil,
 		}
 		m.header = ins
 		m.tail = ins
@@ -75,26 +70,27 @@ func (m *memcache) Set(key string, value interface{}) {
 	ins, ext := m.holder[key]
 	if !ext {
 		ins = &node{
-			value: value,
-			prv:   nil,
-			nxt:   m.header,
+			Key:   key,
+			Value: value,
+			Prv:   nil,
+			Nxt:   m.header,
 		}
 
 		if m.header == nil {
 			m.header = ins
 		} else {
-			m.header.prv = ins
-			ins.nxt = m.header
+			m.header.Prv = ins
+			ins.Nxt = m.header
 			m.header = ins
 		}
 
 		// 处理最后尾巴
 		if m.size == m.cap {
 			tail := m.tail
-			if tail.prv != nil {
-				prv := tail.prv
+			if tail.Prv != nil {
+				prv := tail.Prv
 				m.tail = prv
-				prv.nxt = nil
+				prv.Nxt = nil
 			}
 			tail = nil
 
@@ -105,20 +101,20 @@ func (m *memcache) Set(key string, value interface{}) {
 		m.holder[key] = ins
 	} else {
 
-		ins.value = value
+		ins.Value = value
 
 		// 如果这个key不是头部
 		// 那么将它移动到头部
 		// 并关联它的下一个到它的上一个
-		if ins.prv != nil {
+		if ins.Prv != nil {
 
 			// 首尾相连
-			ins.prv.nxt = ins.nxt
-			ins.prv = nil
+			ins.Prv.Nxt = ins.Nxt
+			ins.Prv = nil
 
 			// 移动到头部
-			m.header.prv = ins
-			ins.nxt = m.header
+			m.header.Prv = ins
+			ins.Nxt = m.header
 
 			m.header = ins
 		}
@@ -131,29 +127,29 @@ func (m *memcache) Get(key string) interface{} {
 		return nil
 	}
 
-	if ins.prv != nil {
+	if ins.Prv != nil {
 
 		m.locker <- struct{}{}
 
 		// 如果已读的这个是尾巴
 		// 那么它的上一个将变成尾巴
-		if ins.nxt == nil {
-			m.tail = ins.prv
+		if ins.Nxt == nil {
+			m.tail = ins.Prv
 		}
 
 		// 首尾相连
-		ins.prv.nxt = ins.nxt
-		ins.prv = nil
+		ins.Prv.Nxt = ins.Nxt
+		ins.Prv = nil
 
 		// 移动到头部
-		m.header.prv = ins
-		ins.nxt = m.header
+		m.header.Prv = ins
+		ins.Nxt = m.header
 		m.header = ins
 
 		<-m.locker
 	}
 
-	return ins.value
+	return ins.Value
 }
 
 func (m *memcache) Size() uint {
@@ -162,4 +158,31 @@ func (m *memcache) Size() uint {
 
 func (m *memcache) Cap() uint {
 	return m.cap
+}
+
+/// 暂时忽略
+/// 还没有完整的控制机制
+func (m *memcache) shadow() shadow {
+	s := shadow{
+		Version: time.Now().Unix(),
+		Size:    m.size,
+		Cap:     m.cap,
+		Nodes:   make([]node, int(m.size)),
+	}
+
+	index := 0
+	cur := m.header
+	for {
+		if cur == nil {
+			break
+		}
+		s.Nodes[index] = node{
+			Key:   cur.Key,
+			Value: cur.Value,
+		}
+		cur = cur.Nxt
+		index++
+	}
+
+	return s
 }
