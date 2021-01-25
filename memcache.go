@@ -8,7 +8,7 @@ import (
 // LRU策略的K/V内存缓存器
 // 这个实现是并发安全的
 //
-type memcache struct {
+type Memcache struct {
 
 	// 当前已缓存数量
 	size uint
@@ -34,8 +34,8 @@ type memcache struct {
 }
 
 // 使用WithLRU策略的缓存器
-func WithLRU(cap uint) *memcache {
-	return &memcache{
+func WithLRU(cap uint) *Memcache {
+	return &Memcache{
 		size:   0,
 		cap:    cap,
 		header: nil,
@@ -45,7 +45,7 @@ func WithLRU(cap uint) *memcache {
 	}
 }
 
-func (m *memcache) Set(key string, value interface{}) {
+func (m *Memcache) Set(key string, value interface{}) {
 	m.locker <- struct{}{}
 	defer func() {
 		<-m.locker
@@ -121,7 +121,7 @@ func (m *memcache) Set(key string, value interface{}) {
 	}
 }
 
-func (m *memcache) Get(key string) interface{} {
+func (m *Memcache) Get(key string) interface{} {
 	ins, ext := m.holder[key]
 	if !ext {
 		return nil
@@ -152,17 +152,17 @@ func (m *memcache) Get(key string) interface{} {
 	return ins.Value
 }
 
-func (m *memcache) Size() uint {
+func (m *Memcache) Size() uint {
 	return m.size
 }
 
-func (m *memcache) Cap() uint {
+func (m *Memcache) Cap() uint {
 	return m.cap
 }
 
 /// 暂时忽略
 /// 还没有完整的控制机制
-func (m *memcache) shadow() shadow {
+func (m *Memcache) shadow() shadow {
 	s := shadow{
 		Version: time.Now().Unix(),
 		Size:    m.size,

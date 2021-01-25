@@ -82,7 +82,7 @@ func Test_Shadow(t *testing.T) {
 
 	s := m.shadow()
 
-	m1 := s.memcache()
+	m1 := s.Memcache()
 
 	h1 := m1.header
 	l1 := m1.tail
@@ -98,7 +98,7 @@ func Test_Shadow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error: %s", err)
 	}
-	m2 := s1.memcache()
+	m2 := s1.Memcache()
 
 	h2 := m2.header
 	l2 := m2.tail

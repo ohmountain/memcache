@@ -20,8 +20,8 @@ type shadow struct {
 	Nodes []node
 }
 
-func (s *shadow) memcache() memcache {
-	m := memcache{
+func (s *shadow) Memcache() Memcache {
+	m := Memcache{
 		size:   s.Size,
 		cap:    s.Cap,
 		locker: make(chan struct{}, 1),
