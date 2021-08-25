@@ -1,9 +1,5 @@
 package memcache
 
-import (
-	"time"
-)
-
 //
 // LRU策略的K/V内存缓存器
 // 这个实现是并发安全的
@@ -152,37 +148,29 @@ func (m *Memcache) Get(key string) interface{} {
 	return ins.Value
 }
 
+func (m *Memcache) Delete(key string) {
+	if m.Get(key) == nil {
+		return
+	}
+
+	m.locker <- struct{}{}
+	origin := m.header
+
+	if origin.Nxt != nil {
+		origin.Prv = nil
+		m.header = origin.Nxt
+	} else {
+		m.header = nil
+		m.tail = nil
+	}
+	m.size = m.size - 1
+	<-m.locker
+}
+
 func (m *Memcache) Size() uint {
 	return m.size
 }
 
 func (m *Memcache) Cap() uint {
 	return m.cap
-}
-
-/// 暂时忽略
-/// 还没有完整的控制机制
-func (m *Memcache) shadow() shadow {
-	s := shadow{
-		Version: time.Now().Unix(),
-		Size:    m.size,
-		Cap:     m.cap,
-		Nodes:   make([]node, int(m.size)),
-	}
-
-	index := 0
-	cur := m.header
-	for {
-		if cur == nil {
-			break
-		}
-		s.Nodes[index] = node{
-			Key:   cur.Key,
-			Value: cur.Value,
-		}
-		cur = cur.Nxt
-		index++
-	}
-
-	return s
 }
