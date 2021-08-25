@@ -74,74 +74,37 @@ func Test_RandomCapacity(t *testing.T) {
 
 }
 
-func Test_Shadow(t *testing.T) {
-	m := WithLRU(10)
-	for i := 0; i < int(m.cap); i++ {
-		m.Set(fmt.Sprintf("%d", i), i)
+func Test_Delete(t *testing.T) {
+	m := WithLRU(1)
+	m.Set("hello", "world")
+	if !reflect.DeepEqual(m.Get("hello"), "world") {
+		t.Logf("Error")
+		t.FailNow()
 	}
 
-	s := m.shadow()
-
-	m1 := s.Memcache()
-
-	h1 := m1.header
-	l1 := m1.tail
-
-	err := s.Persist()
-	if err != nil {
-		t.Fatalf("Error: %s", err)
+	m.Delete("hello")
+	if m.Size() != 0 {
+		t.Logf("Error size")
+		t.FailNow()
 	}
 
-	file := fmt.Sprintf("%d.bin", s.Version)
-	s1 := shadow{}
-	s1.FromFile(file)
-	if err != nil {
-		t.Fatalf("Error: %s", err)
-	}
-	m2 := s1.Memcache()
-
-	h2 := m2.header
-	l2 := m2.tail
-
-	//
-	// 这个测试就是要保证保存快照到硬盘后，再从硬盘快照中恢复时
-	// 缓存内容是一致的，淘汰机制是一致的
-	//
-
-	// 按顺序测试
-	for {
-		if h1 == nil || h2 == nil {
-			break
-		}
-
-		if !reflect.DeepEqual(h1.Key, h2.Key) {
-			t.Fatalf("Next.Key fail: expected [%s], got [%s]", h1.Key, h2.Key)
-		}
-
-		if !reflect.DeepEqual(h1.Value, h2.Value) {
-			t.Fatalf("Next.Value fail: expected [%s], got [%s]", h1.Value, h2.Value)
-		}
-
-		h1 = h1.Nxt
-		h2 = h2.Nxt
+	if m.header != nil {
+		t.Logf("Error header")
+		t.FailNow()
 	}
 
-	// 按逆序测试
-	for {
+	if m.tail != nil {
+		t.Logf("Error tail")
+		t.FailNow()
+	}
 
-		if l1 == nil || l2 == nil {
-			break
-		}
+	m = WithLRU(2)
+	m.Set("1", 1)
+	m.Set("2", 2)
 
-		if !reflect.DeepEqual(l1.Key, l2.Key) {
-			t.Fatalf("Prev.Key fail: expected [%s], got [%s]", l1.Key, l2.Key)
-		}
-
-		if !reflect.DeepEqual(l1.Value, l2.Value) {
-			t.Fatalf("Prev.Value fail: expected [%s], got [%s]", l1.Value, l2.Value)
-		}
-
-		l1 = l1.Prv
-		l2 = l2.Prv
+	m.Delete("1")
+	if !reflect.DeepEqual(2, m.header.Value) {
+		t.Logf("Error header, 2 != %d", m.header.Value)
+		t.FailNow()
 	}
 }
