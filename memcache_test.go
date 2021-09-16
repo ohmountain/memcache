@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 )
 
 func run(n int, t *testing.T, wg *sync.WaitGroup) {
@@ -13,7 +14,7 @@ func run(n int, t *testing.T, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	capacity := uint(n)
-	m := WithLRU(capacity)
+	m := WithLRU(capacity, false)
 	if !reflect.DeepEqual(capacity, m.Cap()) {
 		t.Fatalf("容量应该是：%d, 但是确是：%d", capacity, m.Cap())
 	}
@@ -75,7 +76,7 @@ func Test_RandomCapacity(t *testing.T) {
 }
 
 func Test_Delete(t *testing.T) {
-	m := WithLRU(1)
+	m := WithLRU(1, false)
 	m.Set("hello", "world")
 	if !reflect.DeepEqual(m.Get("hello"), "world") {
 		t.Logf("Error")
@@ -98,7 +99,7 @@ func Test_Delete(t *testing.T) {
 		t.FailNow()
 	}
 
-	m = WithLRU(2)
+	m = WithLRU(2, false)
 	m.Set("1", 1)
 	m.Set("2", 2)
 
@@ -107,4 +108,39 @@ func Test_Delete(t *testing.T) {
 		t.Logf("Error header, 2 != %d", m.header.Value)
 		t.FailNow()
 	}
+}
+
+func Test_TTl(t *testing.T) {
+	m := WithLRU(100, true)
+	ticker := time.NewTicker(3600 * time.Second)
+
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("%d", i)
+		val := fmt.Sprintf("hello-%d", i)
+		m.SetExpire(key, val, 2)
+	}
+
+	t.Logf("缓存器还有数据哦: %d", m.Size())
+
+	for i := 0; i < 100; i++ {
+		c := WithLRU(100, true)
+		for j := 0; j < 100; j++ {
+			key := fmt.Sprintf("%d", j)
+			c.SetExpire(key, "bbbb", int64(j+1))
+		}
+	}
+
+loop:
+	for {
+		select {
+		case <-ticker.C:
+			break loop
+		}
+	}
+
+	if m.Size() > 0 {
+		t.Logf("错误：缓存器还有数据哦: %d", m.Size())
+	}
+
+	t.Logf("%#v", m.expired)
 }
