@@ -1,5 +1,11 @@
 package memcache
 
+import (
+	"os"
+	"os/signal"
+	"time"
+)
+
 //
 // LRU策略的K/V内存缓存器
 // 这个实现是并发安全的
@@ -27,18 +33,49 @@ type Memcache struct {
 	// 数据存储器，一个map
 	// 读取和写入的复杂度都为O(1)
 	holder map[string]*node
+
+	// 是否允许超时处理
+	enableExpired bool
+
+	// 如果设置了过期时间
+	// 此处存储了数据的过期时间和key
+	expired map[int64][]string
 }
 
 // 使用WithLRU策略的缓存器
-func WithLRU(cap uint) *Memcache {
-	return &Memcache{
-		size:   0,
-		cap:    cap,
-		header: nil,
-		tail:   nil,
-		locker: make(chan struct{}, 1),
-		holder: map[string]*node{},
+func WithLRU(cap uint, enableExpired bool) *Memcache {
+	ins := &Memcache{
+		size:          0,
+		cap:           cap,
+		header:        nil,
+		tail:          nil,
+		locker:        make(chan struct{}, 1),
+		holder:        map[string]*node{},
+		expired:       make(map[int64][]string),
+		enableExpired: enableExpired,
 	}
+
+	if !enableExpired {
+		return ins
+	}
+
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt)
+	ticker := time.NewTicker(time.Second / 10) // 0.1s
+
+	go func() {
+		for {
+			select {
+			case <-c:
+				ticker.Stop()
+				return
+			case <-ticker.C:
+				ins.checkExpired()
+			}
+		}
+	}()
+
+	return ins
 }
 
 func (m *Memcache) Set(key string, value interface{}) {
@@ -117,6 +154,48 @@ func (m *Memcache) Set(key string, value interface{}) {
 	}
 }
 
+func (m *Memcache) SetExpire(key string, value interface{}, ttl int64) {
+
+	// 如果初始化时没有启用过期机制
+	// 则不设置值
+	if !m.enableExpired {
+		return
+	}
+
+	m.locker <- struct{}{}
+	ttlKey := time.Now().UnixNano()/1e6 + ttl*1000
+	ext, ok := m.expired[ttlKey]
+	if !ok {
+		ext = make([]string, 0)
+		ext = append(ext, key)
+		m.expired[ttlKey] = ext
+		<-m.locker
+		m.Set(key, value)
+		return
+	}
+
+	ext = append(ext, key)
+	m.expired[ttlKey] = ext
+	<-m.locker
+
+	m.Set(key, value)
+}
+
+func (m *Memcache) checkExpired() {
+	now := time.Now().UnixNano() / 1e6
+	for ttl, values := range m.expired {
+		if ttl <= now {
+			for _, key := range values {
+				m.Delete(key)
+			}
+
+			m.locker <- struct{}{}
+			delete(m.expired, ttl)
+			<-m.locker
+		}
+	}
+}
+
 func (m *Memcache) Get(key string) interface{} {
 	ins, ext := m.holder[key]
 	if !ext {
@@ -164,6 +243,7 @@ func (m *Memcache) Delete(key string) {
 		m.tail = nil
 	}
 	m.size = m.size - 1
+	delete(m.holder, key)
 	<-m.locker
 }
 
