@@ -37,4 +37,5 @@ func main() {
 ```
 
 **Difference between TTL and Non-TTL**
+
 If ttl is not used, it is just an LRU memory buffer; if ttl is used, then it adds a mechanism of expiration by time on the basis of LRU, which means that even if the LRU mechanism does not take effect, the buffer will automatically clean up expired k/v.
