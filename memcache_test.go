@@ -61,11 +61,11 @@ func Test_RandomCapacity(t *testing.T) {
 	wg := sync.WaitGroup{}
 	ch := make(chan struct{}, 8)
 
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 1000; i++ {
 		ch <- struct{}{}
 		wg.Add(1)
 		go func() {
-			r := rand.Intn(100)
+			r := rand.Intn(100000)
 			run(r, t, &wg)
 			<-ch
 		}()
@@ -112,7 +112,7 @@ func Test_Delete(t *testing.T) {
 
 func Test_TTl(t *testing.T) {
 	m := WithLRU(100, true)
-	ticker := time.NewTicker(3600 * time.Second)
+	ticker := time.NewTicker(10 * time.Second)
 
 	for i := 0; i < 10; i++ {
 		key := fmt.Sprintf("%d", i)
