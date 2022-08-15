@@ -55,6 +55,8 @@ func WithLRU(cap uint, enableExpired bool) *Memcache {
 		enableExpired: enableExpired,
 	}
 
+	lives.add(ins)
+
 	if !enableExpired {
 		return ins
 	}
@@ -258,4 +260,26 @@ func (m *Memcache) Size() uint {
 // Cap 获取缓存容量
 func (m *Memcache) Cap() uint {
 	return m.cap
+}
+
+// 清除所有缓存
+func (m *Memcache) Clear() {
+	m.Lock()
+	header := m.header
+	for {
+		if header == nil {
+			break
+		}
+
+		// 解引用
+		next := header.Nxt
+		header.Nxt = nil
+		header = next
+	}
+	m.header = nil
+	m.tail = nil
+	m.size = 0
+	m.expired = make(map[int64][]string)
+	m.holder = make(map[string]*node)
+	m.Unlock()
 }

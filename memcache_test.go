@@ -144,3 +144,28 @@ loop:
 
 	t.Logf("%#v", m.expired)
 }
+
+func Test_Monitor(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		m := WithLRU(10, false)
+		m.Set("ze", i)
+	}
+
+	for _, m := range lives.ins {
+		if m.Size() != 1 {
+			t.Fatalf("Error 0")
+		}
+	}
+
+	if Lives() != 100 {
+		t.Fatalf("Error 1")
+	}
+
+	CLEAR_ALL()
+
+	for _, m := range lives.ins {
+		if m.Size() != 0 {
+			t.Fatalf("Error 2")
+		}
+	}
+}
