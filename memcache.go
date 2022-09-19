@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -62,7 +63,7 @@ func WithLRU(cap uint, enableExpired bool) *Memcache {
 	}
 
 	c := make(chan os.Signal)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGHUP, syscall.SIGINT, syscall.SIGSEGV, os.Interrupt, os.Kill)
 	ticker := time.NewTicker(time.Second / 10) // 0.1s
 
 	go func() {
