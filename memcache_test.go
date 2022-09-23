@@ -14,7 +14,7 @@ func run(n int, t *testing.T, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	capacity := uint(n)
-	m := WithLRU(capacity, false)
+	m := WithLRU[int](capacity, false)
 	if !reflect.DeepEqual(capacity, m.Cap()) {
 		t.Fatalf("容量应该是：%d, 但是确是：%d", capacity, m.Cap())
 	}
@@ -29,54 +29,83 @@ func run(n int, t *testing.T, wg *sync.WaitGroup) {
 
 	for i := 0; i < int(capacity); i++ {
 		v := m.Get(fmt.Sprintf("%d", i))
-		if !reflect.DeepEqual(v, i) {
-			t.Fatalf("Want: %v, got: %v", i, v)
+		if !reflect.DeepEqual(*v, i) {
+			t.Fatalf("Want: %v, got: %v", i, *v)
 		}
 
 		// 每次读取后，读取的节点都会变成header
-		if !reflect.DeepEqual(m.header.Value, v) {
+		if !reflect.DeepEqual(m.header.Value, *v) {
 			t.Fatalf("m.Header error, Want: %v, got: %v", v, m.header.Value)
 		}
 
-		// 尾巴
-		func() {
-			if uint(i) < capacity-1 {
-				if !reflect.DeepEqual(m.tail.Value, i+1) {
-					t.Fatalf("m.Tail error, Want: %v, got: %v", i+1, m.tail.Value)
-				}
+		if m.header.Prv != nil {
+			if m.header == nil {
+				t.Logf("Header is nill")
 			}
 
-			// 循环一遍
-			if uint(i) == capacity-1 {
-				if !reflect.DeepEqual(m.tail.Value, 0) {
-					t.Fatalf("m.Tail error, Want: %v, got: %v", 0, m.tail.Value)
-				}
+			if m.header.Prv == nil {
+				t.Logf("Header.Prv is nill: %#v", reflect.DeepEqual(m.header.Prv, nil))
 			}
-		}()
+			t.Fatalf("m.Header error, %v, Want: nil, got: %v", reflect.DeepEqual(m.header.Prv, nil), m.header.Prv.Value)
+		}
+
+		// 尾巴
+		if uint(i) < capacity-1 {
+			if !reflect.DeepEqual(m.tail.Value, i+1) {
+				t.Fatalf("m.Tail error, Want: %v, got: %v", i+1, m.tail.Value)
+			}
+		}
+
+		// 循环一遍
+		if uint(i) == capacity-1 {
+			if !reflect.DeepEqual(m.tail.Value, 0) {
+				t.Fatalf("m.Tail error, Want: %v, got: %v", 0, m.tail.Value)
+			}
+		}
 	}
 }
 
 func Test_RandomCapacity(t *testing.T) {
-
 	wg := sync.WaitGroup{}
-	ch := make(chan struct{}, 8)
+	ch := make(chan struct{}, 16)
 
 	for i := 0; i < 1000; i++ {
 		ch <- struct{}{}
 		wg.Add(1)
 		go func() {
-			r := rand.Intn(100000)
+			r := rand.Intn(500000)
 			run(r, t, &wg)
 			<-ch
 		}()
 	}
 
 	wg.Wait()
+}
 
+func Test_RandomGet(t *testing.T) {
+	n := 10000
+	r := rand.Intn(n)
+	t.Logf("R: %d", r)
+	cache := WithLRU[int](uint(r), true)
+	for i := 0; i < r; i++ {
+		cache.Set(fmt.Sprintf("%d", i), i)
+	}
+
+	wg := sync.WaitGroup{}
+	for i := 0; i < r; i++ {
+		wg.Add(1)
+		go func() {
+			cache.Set(fmt.Sprintf("%d", rand.Intn(n)), rand.Intn(n))
+			cache.Get(fmt.Sprintf("%d", rand.Intn(n)))
+			wg.Done()
+		}()
+	}
+
+	wg.Wait()
 }
 
 func Test_Delete(t *testing.T) {
-	m := WithLRU(1, false)
+	m := WithLRU[string](1, false)
 	m.Set("hello", "world")
 	if !reflect.DeepEqual(m.Get("hello"), "world") {
 		t.Logf("Error")
@@ -99,19 +128,19 @@ func Test_Delete(t *testing.T) {
 		t.FailNow()
 	}
 
-	m = WithLRU(2, false)
-	m.Set("1", 1)
-	m.Set("2", 2)
+	m1 := WithLRU[int](2, false)
+	m1.Set("1", 1)
+	m1.Set("2", 2)
 
 	m.Delete("1")
-	if !reflect.DeepEqual(2, m.header.Value) {
-		t.Logf("Error header, 2 != %d", m.header.Value)
+	if !reflect.DeepEqual(2, m1.header.Value) {
+		t.Logf("Error header, 2 != %d", m1.header.Value)
 		t.FailNow()
 	}
 }
 
 func Test_TTl(t *testing.T) {
-	m := WithLRU(100, true)
+	m := WithLRU[string](100, true)
 	ticker := time.NewTicker(10 * time.Second)
 
 	for i := 0; i < 10; i++ {
@@ -123,11 +152,12 @@ func Test_TTl(t *testing.T) {
 	t.Logf("缓存器还有数据哦: %d", m.Size())
 
 	for i := 0; i < 100; i++ {
-		c := WithLRU(100, true)
+		c := WithLRU[string](100, true)
 		for j := 0; j < 100; j++ {
 			key := fmt.Sprintf("%d", j)
 			c.SetExpire(key, "bbbb", int64(j+1))
 		}
+		c.Get("adsds")
 	}
 
 loop:
@@ -147,7 +177,7 @@ loop:
 
 func Test_Monitor(t *testing.T) {
 	for i := 0; i < 100; i++ {
-		m := WithLRU(10, false)
+		m := WithLRU[int](10, false)
 		m.Set("ze", i)
 	}
 

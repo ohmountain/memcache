@@ -12,7 +12,7 @@ import (
 // LRU策略的K/V内存缓存器
 // 这个实现是并发安全的
 //
-type Memcache struct {
+type Memcache[T CacheAble] struct {
 
 	// 读写控制器
 	// 所有读写操作都必须获得这个锁
@@ -26,15 +26,15 @@ type Memcache struct {
 	cap uint
 
 	// 记录最后访问的一个数据
-	header *node
+	header *node[T]
 
 	// 记录最早访问的一个数据
 	// 如果容量溢出，将不再缓存
-	tail *node
+	tail *node[T]
 
 	// 数据存储器，一个map
 	// 读取和写入的复杂度都为O(1)
-	holder map[string]*node
+	holder map[string]*node[T]
 
 	// 是否允许超时处理
 	enableExpired bool
@@ -45,13 +45,14 @@ type Memcache struct {
 }
 
 // WithLRU 使用WithLRU策略的缓存器
-func WithLRU(cap uint, enableExpired bool) *Memcache {
-	ins := &Memcache{
+func WithLRU[T CacheAble](cap uint, enableExpired bool) *Memcache[T] {
+
+	ins := &Memcache[T]{
 		size:          0,
 		cap:           cap,
 		header:        nil,
 		tail:          nil,
-		holder:        map[string]*node{},
+		holder:        map[string]*node[T]{},
 		expired:       make(map[int64][]string),
 		enableExpired: enableExpired,
 	}
@@ -81,12 +82,12 @@ func WithLRU(cap uint, enableExpired bool) *Memcache {
 	return ins
 }
 
-func (m *Memcache) Set(key string, value interface{}) {
+func (m *Memcache[T]) Set(key string, value T) {
 	m.Lock()
 
 	// 最初一个缓存内容
 	if m.size == 0 {
-		ins := &node{
+		ins := &node[T]{
 			Key:   key,
 			Value: value,
 			Prv:   nil,
@@ -103,7 +104,7 @@ func (m *Memcache) Set(key string, value interface{}) {
 
 	ins, ext := m.holder[key]
 	if !ext {
-		ins = &node{
+		ins = &node[T]{
 			Key:   key,
 			Value: value,
 			Prv:   nil,
@@ -157,7 +158,7 @@ func (m *Memcache) Set(key string, value interface{}) {
 	m.Unlock()
 }
 
-func (m *Memcache) SetExpire(key string, value interface{}, ttl int64) {
+func (m *Memcache[T]) SetExpire(key string, value T, ttl int64) {
 
 	// 如果初始化时没有启用过期机制
 	// 则不设置值
@@ -185,7 +186,7 @@ func (m *Memcache) SetExpire(key string, value interface{}, ttl int64) {
 	m.Set(key, value)
 }
 
-func (m *Memcache) checkExpired() {
+func (m *Memcache[T]) checkExpired() {
 	now := time.Now().UnixNano() / 1e6
 	for ttl, values := range m.expired {
 		if ttl <= now {
@@ -201,15 +202,15 @@ func (m *Memcache) checkExpired() {
 }
 
 // Get 获取一个缓存
-func (m *Memcache) Get(key string) interface{} {
+func (m *Memcache[T]) Get(key string) *T {
+	m.Lock()
 	ins, ext := m.holder[key]
 	if !ext {
+		m.Unlock()
 		return nil
 	}
 
 	if ins.Prv != nil {
-
-		m.Lock()
 
 		// 如果已读的这个是尾巴
 		// 那么它的上一个将变成尾巴
@@ -226,14 +227,14 @@ func (m *Memcache) Get(key string) interface{} {
 		ins.Nxt = m.header
 		m.header = ins
 
-		m.Unlock()
 	}
+	m.Unlock()
 
-	return ins.Value
+	return &(ins.Value)
 }
 
 // Delete 主动删除缓存
-func (m *Memcache) Delete(key string) {
+func (m *Memcache[T]) Delete(key string) {
 	if m.Get(key) == nil {
 		return
 	}
@@ -254,17 +255,17 @@ func (m *Memcache) Delete(key string) {
 }
 
 // Size 获取当前长度
-func (m *Memcache) Size() uint {
+func (m *Memcache[T]) Size() uint {
 	return m.size
 }
 
 // Cap 获取缓存容量
-func (m *Memcache) Cap() uint {
+func (m *Memcache[T]) Cap() uint {
 	return m.cap
 }
 
 // 清除所有缓存
-func (m *Memcache) Clear() {
+func (m *Memcache[T]) Clear() {
 	m.Lock()
 	header := m.header
 	for {
@@ -277,10 +278,11 @@ func (m *Memcache) Clear() {
 		header.Nxt = nil
 		header = next
 	}
+
 	m.header = nil
 	m.tail = nil
 	m.size = 0
 	m.expired = make(map[int64][]string)
-	m.holder = make(map[string]*node)
+	m.holder = make(map[string]*node[T])
 	m.Unlock()
 }

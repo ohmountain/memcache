@@ -1,8 +1,10 @@
 package memcache
 
-type node struct {
+type CacheAble any
+
+type node[T CacheAble] struct {
 	Key   string
-	Value interface{}
-	Prv   *node
-	Nxt   *node
+	Value T
+	Prv   *node[T]
+	Nxt   *node[T]
 }

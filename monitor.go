@@ -6,21 +6,27 @@ package memcache
 
 import "sync"
 
+type MonitorAble interface {
+	Size() uint
+	Cap() uint
+	Clear()
+}
+
 // 用来保存实例索引，
 // 方便获得一些观察的内容
 type monitor struct {
 	sync.RWMutex
-	ins []*Memcache
+	ins []MonitorAble
 }
 
-func (ins *monitor) add(m *Memcache) {
+func (ins *monitor) add(m MonitorAble) {
 	ins.Lock()
 	ins.ins = append(ins.ins, m)
 	ins.Unlock()
 }
 
 var lives = monitor{
-	ins: make([]*Memcache, 0),
+	ins: make([]MonitorAble, 0),
 }
 
 // 清除整个缓存池子
