@@ -11,7 +11,6 @@ import (
 // Memcache
 // LRU策略的K/V内存缓存器
 // 这个实现是并发安全的
-//
 type Memcache[T CacheAble] struct {
 
 	// 读写控制器
@@ -84,6 +83,10 @@ func WithLRU[T CacheAble](cap uint, enableExpired bool) *Memcache[T] {
 
 func (m *Memcache[T]) Set(key string, value T) {
 	m.Lock()
+	defer func() {
+		recover()
+		m.Unlock()
+	}()
 
 	// 最初一个缓存内容
 	if m.size == 0 {
@@ -98,11 +101,11 @@ func (m *Memcache[T]) Set(key string, value T) {
 		m.size = m.size + 1
 
 		m.holder[key] = ins
-		m.Unlock()
 		return
 	}
 
 	ins, ext := m.holder[key]
+
 	if !ext {
 		ins = &node[T]{
 			Key:   key,
@@ -134,28 +137,26 @@ func (m *Memcache[T]) Set(key string, value T) {
 		}
 
 		m.holder[key] = ins
-	} else {
-
-		ins.Value = value
-
-		// 如果这个key不是头部
-		// 那么将它移动到头部
-		// 并关联它的下一个到它的上一个
-		if ins.Prv != nil {
-
-			// 首尾相连
-			ins.Prv.Nxt = ins.Nxt
-			ins.Prv = nil
-
-			// 移动到头部
-			m.header.Prv = ins
-			ins.Nxt = m.header
-
-			m.header = ins
-		}
+		return
 	}
 
-	m.Unlock()
+	ins.Value = value
+
+	// 如果这个key不是头部
+	// 那么将它移动到头部
+	// 并关联它的下一个到它的上一个
+	if ins.Prv != nil {
+
+		// 首尾相连
+		ins.Prv.Nxt = ins.Nxt
+		ins.Prv = nil
+
+		// 移动到头部
+		m.header.Prv = ins
+		ins.Nxt = m.header
+
+		m.header = ins
+	}
 }
 
 func (m *Memcache[T]) SetExpire(key string, value T, ttl int64) {
@@ -204,9 +205,13 @@ func (m *Memcache[T]) checkExpired() {
 // Get 获取一个缓存
 func (m *Memcache[T]) Get(key string) *T {
 	m.Lock()
+	defer func() {
+		recover()
+		m.Unlock()
+	}()
+
 	ins, ext := m.holder[key]
 	if !ext {
-		m.Unlock()
 		return nil
 	}
 
@@ -228,7 +233,6 @@ func (m *Memcache[T]) Get(key string) *T {
 		m.header = ins
 
 	}
-	m.Unlock()
 
 	return &(ins.Value)
 }
