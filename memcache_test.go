@@ -107,7 +107,8 @@ func Test_RandomGet(t *testing.T) {
 func Test_Delete(t *testing.T) {
 	m := WithLRU[string](1, false)
 	m.Set("hello", "world")
-	if !reflect.DeepEqual(m.Get("hello"), "world") {
+	hello := m.Get("hello")
+	if hello == nil || *hello != "world" {
 		t.Logf("Error")
 		t.FailNow()
 	}
