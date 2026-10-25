@@ -152,3 +152,8 @@ two halves and comparing them with benchstat before believing any delta.
 
 - `2026-10-25-baseline.md` — the Stage A baseline frozen from an actual full
   collection; the authoritative comparison point for Stage B/C candidates.
+- `2026-10-25-ttl-b1.md` — the B1 intermediate acceptance checkpoint against
+  the frozen Stage A runtime. Foreground reclamation is bounded and the first
+  post-expiry Set collapses from 7.21ms to 2.19µs, but the old ticker cleaner
+  still full-purges, so the concentrated-expiry P99 and full-reclamation gates
+  are not met and B1 is not a Stage B pass.
