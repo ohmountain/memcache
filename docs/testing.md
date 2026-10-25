@@ -12,7 +12,15 @@ race detector, coverage instrumentation, built-in fuzzing, and benchmarks.
 | `expiration_test.go` | Exact expiry boundaries, renewal/overwrite, delete/evict/clear then reinsert, TTL bounds, metadata retention |
 | `lifecycle_test.go` | Close/unregister/join, global clear, collection of abandoned handles, real cleaner, process-signal isolation |
 | `concurrency_test.go` | Same-key deletion, mixed operations, concurrent Close/global clear/registration, snapshot stability |
-| `fuzz_test.go` | Values, misses, capacity, complete recency order, and internal invariants against an independent slice-based model |
+| `model_snapshot_test.go` | Lock-held snapshots that preserve expired physical entries, no aliasing, consistency under concurrent mutation |
+| `model_state_test.go` | Independent reference model (map + recency slice), TTL-disabled and post-Close contracts, boundary/clone self-tests, large deterministic sequences |
+| `fuzz_test.go` | Byte-encoded operations replayed against the model; observation uses snapshots only, so watching the cache never purges or refreshes |
+| `history_checker_test.go` | Bounded serial-order search honoring real time; impossible reads, budget exhaustion, malformed events, final-state matching |
+| `history_integration_test.go` | Recorded concurrent histories on a real cache replayed through the checker; renewal racing checkExpired |
+| `workload_test.go` | Deterministic read/write mixes (positional ratios), distribution validation, expiry fixture with one deadline |
+| `benchmark_*_test.go` | Named micro benchmarks: workloads, payloads, first post-expiry operation with `-benchtime=1x` |
+| `performance_load_test.go` | Open-loop generator: nearest-rank quantiles, overload drop accounting, scheduler lag, cancellation join, Set-only latency |
+| `performance*_test.go` | Scenario evidence: JSON schema with O_EXCL writes, real expiry fixtures, instance/lifecycle resource rounds |
 | `example_test.go` | Executable public-package examples |
 | `benchmark_test.go` | Get/Lookup/update/TTL renewal and concurrent reads, with allocations reported |
 
@@ -37,8 +45,36 @@ go test -race -shuffle=on -count=3 -timeout=120s ./...
 go test -count=1 -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out
 go test -run='^$' -fuzz='^FuzzCacheModel$' -fuzztime=15s -parallel=4 .
-go test -run='^$' -bench=. -benchmem -benchtime=200ms ./...
+go test -run='^$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload|BenchmarkCachePayload)$' -benchmem -benchtime=200ms ./...
 ```
+
+Benchmarks are layered: `make bench` runs the short 1K-key workloads;
+`make bench-full` adds the 100K/1M scenarios behind `-cache-perf-full=true`
+with ten repetitions across `-cpu=1,2,4,8`; `make bench-expiry` measures one
+post-expiry operation per fresh fixture and therefore requires
+`-benchtime=1x` — with an adaptive `b.N` it skips instead of refilling
+100K/1M caches repeatedly. `TestCachePerformance` skips under a plain
+`go test ./...`; the staged performance scenarios run explicitly:
+
+```sh
+go test -run='^TestCachePerformance$' -count=1 -timeout=60s . \
+  -args -cache-perf-case=expiry-burst -cache-perf-out=/tmp/new-evidence.json
+```
+
+The output file is created with O_EXCL: evidence is written once and never
+overwritten — pick a new path for every run instead of deleting old results.
+`scripts/perf-baseline.sh` (Linux/macOS; Windows uses the equivalent
+go-test commands from docs/performance/README.md) collects the whole bundle:
+
+```sh
+make perf-baseline PERFSUITE=smoke            # pipeline check, NOT a baseline
+make perf-baseline                            # full formal collection
+make perf-baseline PERFSUITE=full PERFOUT=/tmp/memcache-perf-002
+```
+
+To replay a recorded history or model failure, rerun with `-run` naming the
+failing test and the seed or shuffle seed Go printed; scenario JSON records
+carry the seed and workload SHA256 next to every measurement.
 
 The race detector requires a supported platform and a C toolchain. Use a shuffle
 seed printed by Go to replay ordering; use `-run` to isolate a regression. Fuzz
