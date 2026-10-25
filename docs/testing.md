@@ -10,6 +10,9 @@ race detector, coverage instrumentation, built-in fuzzing, and benchmarks.
 | `memcache_test.go` | Capacity, LRU read/update order, deleting every position, Clear/reuse, snapshots, zero and nil values |
 | `invariants_test.go` | Map/list agreement, capacity bound, heap ordering and indices, one expiry record per item |
 | `expiration_test.go` | Exact expiry boundaries, renewal/overwrite, delete/evict/clear then reinsert, TTL bounds, metadata retention |
+| `foreground_expiration_test.go` | B1 foreground bound: physical snapshots prove one-slot reclamation, target-only delete/update/reinsert, expired-before-live-LRU preference, and unchanged TTL-disabled/zero-capacity behavior |
+| `cleaner_clock_test.go` | Single-owner timer state machine: one `NewTimer`, armed/consumed/stopped transitions, Go 1.18 `Stop=false` drain before `Reset`, repeated stop, no blocking; synchronized fake clock and timer |
+| `cleaner_test.go` | Background scheduling: batch limit 64, empty-heap sleep with no timer or periodic clock read, deadline changes (earlier/extended/deleted/cancelled), coalesced wakes, stale event after `Clear`, `Close` between batches, disabled/zero-capacity, and the cleaner-versus-operation histories |
 | `lifecycle_test.go` | Close/unregister/join, global clear, collection of abandoned handles, real cleaner, process-signal isolation |
 | `concurrency_test.go` | Same-key deletion, mixed operations, concurrent Close/global clear/registration, snapshot stability |
 | `model_snapshot_test.go` | Lock-held snapshots that preserve expired physical entries, no aliasing, consistency under concurrent mutation |
@@ -26,11 +29,20 @@ race detector, coverage instrumentation, built-in fuzzing, and benchmarks.
 
 The deterministic TTL tests inject a clock and disable the real cleaner. They
 advance directly to deadlines, so a test does not pass merely because a long
-sleep eventually permits cleanup. Separate integration tests exercise the real
-cleaner and GC finalization with bounded five-second deadlines. Finalization
-timing is deliberately not part of the public contract; use Close in application
-code. The signal test sends SIGINT only to a dedicated child test process and is
-skipped on Windows/Plan 9.
+sleep eventually permits cleanup. The B2 scheduler tests inject both the clock
+and the timer: a mutex-protected fake records `NewTimer`/`Reset`/`Stop` calls,
+tests park the worker on channels or hooks at exact seams, and a two-second
+guard only catches a hung test. They assert that an empty heap creates no timer
+and reads no clock, that a coalesced wake cannot act on a stale deadline, and
+that a stale timer event arriving after `Clear` does not delete a rebuilt value.
+Separate integration tests exercise the real cleaner and GC finalization with
+bounded five-second deadlines. Finalization timing is deliberately not part of
+the public contract; use Close in application code. The signal test sends SIGINT
+only to a dedicated child test process and is skipped on Windows/Plan 9.
+
+The cleaner's `arm`/`stop` state machine must also run with the real Go 1.18
+timer semantics. `go test` under Go 1.18 is the evidence for that, not a
+`GODEBUG` switch on a newer toolchain and not cross-compilation.
 
 Tests close their own cache instances and do not depend on execution order. The
 global-monitor tests must not use `t.Parallel`, because `CLEAR_ALL` intentionally
@@ -92,6 +104,9 @@ Statement coverage measures executed code; race/model/behavior checks are still
 required and cannot be replaced by a coverage percentage.
 
 CI runs vet, tests, and shuffled race checks on Go 1.18/Linux and stable Go on
-Linux, macOS, and Windows. Stable Linux also checks formatting, coverage, and
-fuzzing. Actions are pinned to immutable commits. Remote CI results require an
-actual GitHub run; writing the workflow does not establish those results.
+Linux, macOS, and Windows. Every matrix entry therefore runs the real
+cleaner/timer and lifecycle tests; the Go 1.18 entry is the old-timer-semantics
+gate. Stable Linux also checks formatting, coverage, and fuzzing. Actions are
+pinned to immutable commits. Cross-compiling or merely having the workflow file
+is not evidence: remote CI results require an actual GitHub run, and results on
+platforms this machine cannot execute stay unverified until such a run exists.

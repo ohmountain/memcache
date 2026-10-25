@@ -105,6 +105,23 @@ steady reports 0 because its TTL-less cache starts no cleaner); always
 disambiguate via the `case` field. Non-applicable keys are omitted — a
 missing key never means zero.
 
+Idle records carry three `now()` instrumentation counters (each call costs one
+atomic increment):
+
+- `empty_heap_checks` — total calls since the cache was constructed. Kept for
+  compatibility with Stage A/B1 records; it includes one deadline read per
+  initial write and one startup observation per worker.
+- `window_now_checks` — calls inside the 3s observation window. Startup
+  observations can still race the window start, so a small nonzero value here
+  is startup, not periodic waking.
+- `tail_now_checks` — calls after the load finished (the settled part of the
+  window). Any periodic wake would show up here; zero is the intended value
+  for the earliest-deadline worker.
+
+No counter alone proves "no timer exists": that proof is the fake-timer test
+(`TestCleanerEmptyHeapSleeps`), which asserts no timer is created and no clock
+is read for an empty heap.
+
 The lifecycle bytes4k run additionally carries `resources_held`: the same
 post-GC heap keys as `resources`, sampled while the payload references are
 still pinned (`runtime.KeepAlive`), where `resources` holds the after-release
@@ -130,10 +147,12 @@ so the label logs carry the full trail, not just a final `ok`.
   100000 expiring plus 1024 permanent entries, so no warm-up traffic evicts
   the target keys. Reclamation time comes from a separate monitor run using
   pure snapshots — `Size` never helps cleaning there.
-- Idle runs count `empty_heap_checks` through an instrumented `now()`
-  (one atomic increment per call). They honestly report today's ticker
-  behavior including that instrumentation overhead; Stage A does not claim
-  "no periodic wake-up" — proving that is Stage B2's acceptance work.
+- Idle runs count `now()` calls through instrumentation (one atomic increment
+  per call). `empty_heap_checks` is the total since construction, kept for
+  compatibility; `window_now_checks` and `tail_now_checks` separate startup
+  observations from the settled window. The idle record therefore reports both
+  the startup cost and whether anything wakes periodically, and it includes the
+  instrumentation overhead.
 - CPU, mutex, and heap profiles are collected in separate processes; numbers
   from profiled runs never fill the latency comparison tables.
 - `benchstat` (external tool, never a dependency of this module) compares
@@ -157,3 +176,9 @@ two halves and comparing them with benchstat before believing any delta.
   post-expiry Set collapses from 7.21ms to 2.19µs, but the old ticker cleaner
   still full-purges, so the concentrated-expiry P99 and full-reclamation gates
   are not met and B1 is not a Stage B pass.
+- `2026-10-25-ttl-b2.md` — the B2 Stage B acceptance report against A plus the
+  B1→B2 attribution. Earliest-deadline scheduling with batches of 64 cuts the
+  valid-tier burst Set P99 by 99.4% and removes the idle periodic wake, but
+  Stage B is not declared a clean pass: full reclamation at expiry-burst 50K is
+  2.17–2.35× the control and scalar Lookup is ≈5.3–5.6% slower, both entering
+  the design review.
