@@ -104,16 +104,22 @@ func (s *cacheState[T]) reclaimSlotLocked(now time.Time) {
 func (s *cacheState[T]) lookup(key string) (T, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.wake != nil {
-		before := s.nextExpiryLocked()
-		defer s.notifyCleanerLocked(before)
-	}
 	n, ok := s.holder[key]
-	if ok && !n.expiresAt.IsZero() && !n.expiresAt.After(s.now()) {
-		s.removeLocked(n)
-		ok = false
-	}
 	if !ok {
+		var zero T
+		return zero, false
+	}
+	if !n.expiresAt.IsZero() && !n.expiresAt.After(s.now()) {
+		// Only a removal can change the expiry heap, so the scheduler
+		// notification is captured here and nowhere else: a hit or a miss
+		// adds no expiry-heap or wake-channel work to this hot path.
+		if s.wake != nil {
+			before := s.nextExpiryLocked()
+			s.removeLocked(n)
+			s.notifyCleanerLocked(before)
+		} else {
+			s.removeLocked(n)
+		}
 		var zero T
 		return zero, false
 	}

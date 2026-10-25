@@ -578,3 +578,18 @@ func TestHistoryCleanerInterleavings(t *testing.T) {
 		}
 	})
 }
+
+// TestCleanerLookupOfDueRootRearms pins the notification contract on the lookup
+// path: reading a due key removes it and changes the heap root, so the worker
+// must re-arm for the next real deadline instead of sleeping on the old one.
+func TestCleanerLookupOfDueRootRearms(t *testing.T) {
+	m, fake, _ := newCleanerFixture(t, 4)
+	ch := seamSignals(fake)
+	m.SetExpire("a", 1, 10)
+	m.SetExpire("b", 2, 30)
+	waitArmedDelay(t, ch, fake, 10*time.Second)
+	fake.Advance(10 * time.Second) // "a" is due; "b" still has 20s left
+	requireMissing(t, m, "a")
+	waitArmedDelay(t, ch, fake, 20*time.Second)
+	assertInvariants(t, m)
+}
