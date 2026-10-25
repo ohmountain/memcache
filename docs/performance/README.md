@@ -178,7 +178,8 @@ two halves and comparing them with benchstat before believing any delta.
   are not met and B1 is not a Stage B pass.
 - `2026-10-25-ttl-b2.md` — the B2 Stage B acceptance report against A plus the
   B1→B2 attribution. Earliest-deadline scheduling with batches of 64 cuts the
-  valid-tier burst Set P99 by 99.4% and removes the idle periodic wake, but
-  Stage B is not declared a clean pass: full reclamation at expiry-burst 50K is
-  2.17–2.35× the control and scalar Lookup is ≈5.3–5.6% slower, both entering
-  the design review.
+  valid-tier burst Set P99 by 99.4% and removes the idle periodic wake. A
+  post-review fix removed scheduler work from the lookup hit path, so the
+  non-TTL and allocation gates pass. Stage B is still not a clean pass: full
+  reclamation at expiry-burst 50K is 2.17–2.35× the control, which is the
+  design-review item, and the Linux/Windows matrix was not run here.
