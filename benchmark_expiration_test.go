@@ -3,6 +3,7 @@ package memcache
 import (
 	"flag"
 	"fmt"
+	"reflect"
 	"strconv"
 	"testing"
 	"time"
@@ -40,25 +41,32 @@ func BenchmarkCacheExpiry(b *testing.B) {
 		capacities = append(capacities, 1000000)
 	}
 	// Each target pairs its measured operation with the post-op state it
-	// must leave behind.
+	// must leave behind. The checks are deliberately strategy-neutral: the
+	// live view and capacity bound must hold for both a full purge and a
+	// bounded foreground reclamation. The exact physical count that B1
+	// guarantees is pinned by foreground_expiration_test.go instead.
 	targets := []struct {
 		name   string
 		run    func(m *Memcache[int])
-		verify func(b *testing.B, snap cacheSnapshot, capacity int)
+		verify func(b *testing.B, snap cacheSnapshot, capacity int, now time.Time)
 	}{
 		{
 			name: "FirstSet",
 			run:  func(m *Memcache[int]) { m.Set("new", 1) },
-			verify: func(b *testing.B, snap cacheSnapshot, capacity int) {
-				if len(snap.Items) != 1 || snap.Items["new"].Value != 1 {
-					b.Fatalf("after first Set over expired entries: %d items", len(snap.Items))
+			verify: func(b *testing.B, snap cacheSnapshot, capacity int, now time.Time) {
+				values, order := liveSnapshot(snap, now)
+				if !reflect.DeepEqual(values, map[string]int{"new": 1}) || !reflect.DeepEqual(order, []string{"new"}) {
+					b.Fatalf("after first Set over expired entries: live values=%v order=%v", values, order)
+				}
+				if uint(len(snap.Items)) > uint(capacity) {
+					b.Fatalf("after first Set over expired entries: %d physical items over capacity %d", len(snap.Items), capacity)
 				}
 			},
 		},
 		{
 			name: "FirstLookup",
 			run:  func(m *Memcache[int]) { m.Lookup("0") },
-			verify: func(b *testing.B, snap cacheSnapshot, capacity int) {
+			verify: func(b *testing.B, snap cacheSnapshot, capacity int, now time.Time) {
 				if len(snap.Items) != capacity-1 {
 					b.Fatalf("lookup must remove only its target: %d of %d remain", len(snap.Items), capacity)
 				}
@@ -67,7 +75,7 @@ func BenchmarkCacheExpiry(b *testing.B) {
 		{
 			name: "Size",
 			run:  func(m *Memcache[int]) { m.Size() },
-			verify: func(b *testing.B, snap cacheSnapshot, capacity int) {
+			verify: func(b *testing.B, snap cacheSnapshot, capacity int, now time.Time) {
 				if len(snap.Items) != 0 {
 					b.Fatalf("Size must purge every expired entry: %d remain", len(snap.Items))
 				}
@@ -86,7 +94,7 @@ func BenchmarkCacheExpiry(b *testing.B) {
 				b.ResetTimer()
 				target.run(m)
 				b.StopTimer()
-				target.verify(b, snapshotCache(m), capacity)
+				target.verify(b, snapshotCache(m), capacity, clock.Now())
 				assertInvariants(b, m)
 			})
 		}

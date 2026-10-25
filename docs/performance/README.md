@@ -29,6 +29,56 @@ Layered entries:
 | `make bench-expiry` | First Set/Lookup/Size after a full-cache expiry event, one operation per fresh fixture (`-benchtime=1x`), 10 repetitions |
 | `make perf-baseline` | Everything above plus the open-loop scenarios, idle/lifecycle runs, and profiles |
 
+## Comparing a candidate against a control
+
+Stage B adds a comparison entry point that is strategy-neutral: the control and
+candidate runtimes are exported from fixed commits and measured with one shared
+test harness.
+
+```sh
+make perf-compare \
+  PERFCONTROL=12698ab PERFCANDIDATE=<candidate-sha> PERFHARNESS=<harness-sha> \
+  PERFROLE=original PERFSUITE=smoke PERFOUT=/tmp/memcache-compare-001
+```
+
+- All three commits and a fresh `PERFOUT` are required. A missing value, a
+  non-commit SHA, or an existing `PERFOUT` fails before any evidence is
+  written, and the Stage A baseline files are left untouched.
+- Only root-level non-test `*.go` files plus `go.mod` come from the control and
+  candidate commits. The working tree is never read, so an uncommitted
+  candidate cannot leak into a measurement, and the current branch is never
+  switched.
+- Test code comes from the harness commit using a closed list:
+  `benchmark_test.go`, `benchmark_expiration_test.go`,
+  `benchmark_payload_test.go`, `workload_test.go`, `performance_load_test.go`,
+  `performance_test.go`, `performance_resources_test.go`, `memcache_test.go`,
+  `expiration_test.go`, `invariants_test.go`, `model_snapshot_test.go`,
+  `model_state_test.go`, `history_checker_test.go`,
+  `history_integration_test.go`. A helper that exists only in the candidate's
+  commit fails the compile step instead of silently widening the harness. Both
+  sides are compiled before anything is timed.
+- `PERFROLE=original` requires the control's runtime blobs to be byte-identical
+  to the frozen Stage A runtime (`12698ab…`) and records that check in the
+  manifest. `PERFROLE=incremental` accepts B1 as the control but stamps the
+  manifest `stage_b_conclusion=attribution-only`: such a run cannot produce a
+  Stage B acceptance verdict.
+- `PERFSUITE=smoke` runs one short micro benchmark and one noop load per side.
+  It checks the pipeline only; never use it for a percentage verdict.
+  `PERFSUITE=full` runs the Stage A matrix — micro benchmarks at `-cpu=1,2,4,8`,
+  the first post-expiry operation, five open-loop scenarios × 1000/10000/50000,
+  idle 1/100/1000, lifecycle, and separate-process profiles — as ten
+  interleaved control/candidate pairs (AB/BA rotation), one subprocess per
+  sample. Control and candidate never run concurrently. Idle and lifecycle
+  scenarios run once per side, matching Stage A's cadence.
+- Each sample keeps its exact command, exit code, and log; `manifest.txt` records
+  the three full SHAs, per-file runtime and harness checksums, the environment,
+  and the SHA256 of every exported file and scenario JSON. Each JSON's workload
+  (action) SHA256 is recorded too, so a reader can confirm both sides replayed
+  the same actions. Profiles run in separate processes and never enter a
+  comparison table.
+- Load accounting is enforced by the harness itself (`verifyLoadAccounting`): a
+  broken run fails instead of emitting a plausible-looking JSON file.
+
 ## What a scenario JSON records
 
 Every `TestCachePerformance` run writes one schema-1 JSON file (created with

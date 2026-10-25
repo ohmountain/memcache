@@ -2,8 +2,9 @@ GO ?= go
 FUZZTIME ?= 15s
 FUZZWORKERS ?= 4
 PERFSUITE ?= full
+PERFROLE ?= original
 
-.PHONY: check fmt-check vet test race coverage fuzz bench bench-full bench-expiry perf-baseline
+.PHONY: check fmt-check vet test race coverage fuzz bench bench-full bench-expiry perf-baseline perf-compare
 
 check: fmt-check vet test race
 
@@ -44,3 +45,13 @@ bench-expiry:
 # smoke verifies the pipeline, full freezes the repeated formal baseline.
 perf-baseline:
 	bash scripts/perf-baseline.sh --suite $(PERFSUITE) $(if $(PERFOUT),--out "$(PERFOUT)",)
+
+# perf-compare measures a candidate commit against a control commit with one
+# shared test harness. PERFROLE=original requires the control to be the frozen
+# Stage A runtime; PERFROLE=incremental allows B1 as the control for
+# attribution only. All three commits and a fresh PERFOUT are required.
+perf-compare:
+	bash scripts/perf-compare.sh \
+		--control "$(PERFCONTROL)" --candidate "$(PERFCANDIDATE)" \
+		--harness "$(PERFHARNESS)" --comparison-role "$(PERFROLE)" \
+		--suite "$(PERFSUITE)" --out "$(PERFOUT)"
