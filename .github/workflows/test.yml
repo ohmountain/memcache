@@ -1,0 +1,44 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            go: '1.18.x'
+          - os: ubuntu-latest
+            go: stable
+          - os: macos-latest
+            go: stable
+          - os: windows-latest
+            go: stable
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+      - run: go vet ./...
+      - run: go test -count=1 -timeout=60s ./...
+      - run: go test -race -shuffle=on -count=3 -timeout=120s ./...
+      - name: Formatting and coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.go == 'stable'
+        run: |
+          make fmt-check
+          make coverage
+      - name: Reference model fuzzing
+        if: matrix.os == 'ubuntu-latest' && matrix.go == 'stable'
+        run: make fuzz FUZZTIME=15s
