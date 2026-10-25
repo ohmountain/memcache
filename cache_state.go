@@ -31,16 +31,20 @@ func (s *cacheState[T]) set(key string, value T, ttl int64, expiring bool) {
 	if s.closed || s.capacity == 0 {
 		return
 	}
-	now := s.now()
-	s.purgeExpiredLocked(now)
-	var deadline time.Time
-	if expiring && s.enableExpired {
-		if ttl <= 0 {
-			if n, ok := s.holder[key]; ok {
-				s.removeLocked(n)
-			}
-			return
+	expiring = expiring && s.enableExpired
+	if expiring && ttl <= 0 {
+		// A nonpositive TTL is a delete request for this key only: it never
+		// reclaims other expired entries.
+		if n, ok := s.holder[key]; ok {
+			s.removeLocked(n)
 		}
+		return
+	}
+	// One now sample serves the target-key deadline check, the capacity
+	// decision, and the new deadline.
+	now := s.now()
+	var deadline time.Time
+	if expiring {
 		duration := maxTTL
 		if ttl <= int64(maxTTL/time.Second) {
 			duration = time.Duration(ttl) * time.Second
@@ -48,12 +52,17 @@ func (s *cacheState[T]) set(key string, value T, ttl int64, expiring bool) {
 		deadline = now.Add(duration)
 	}
 	n, ok := s.holder[key]
+	if ok && !n.expiresAt.IsZero() && !n.expiresAt.After(now) {
+		// An expired target is treated as absent: remove only its own record.
+		s.removeLocked(n)
+		n, ok = nil, false
+	}
 	if ok {
 		n.value = value
 		s.order.MoveToFront(n.element)
 	} else {
 		if uint(len(s.holder)) >= s.capacity {
-			s.removeLocked(s.order.Back().Value.(*node[T]))
+			s.reclaimSlotLocked(now)
 		}
 		n = &node[T]{key: key, value: value, expiryIndex: -1}
 		n.element = s.order.PushFront(n)
@@ -68,6 +77,19 @@ func (s *cacheState[T]) set(key string, value T, ttl int64, expiring bool) {
 	case !deadline.IsZero():
 		heap.Push(&s.expiry, n)
 	}
+}
+
+// reclaimSlotLocked frees exactly one slot for a new key. When the earliest
+// deadline has already passed, that expired entry is reclaimed instead of a
+// live one; otherwise the LRU tail is evicted as before. It never scans the
+// map or the list for further expired entries, so a single write's reclamation
+// work stays bounded.
+func (s *cacheState[T]) reclaimSlotLocked(now time.Time) {
+	if len(s.expiry) > 0 && !s.expiry[0].expiresAt.After(now) {
+		s.removeLocked(s.expiry[0])
+		return
+	}
+	s.removeLocked(s.order.Back().Value.(*node[T]))
 }
 
 func (s *cacheState[T]) lookup(key string) (T, bool) {

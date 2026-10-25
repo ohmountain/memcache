@@ -40,6 +40,12 @@ func main() {
 - With TTL enabled, an entry is unavailable at or after its deadline, even before
   background cleanup runs. `Size()` counts live entries. Renewing a TTL replaces
   its previous deadline. `Set()` removes any previous TTL.
+- An ordinary write does not sweep other keys' expired entries. It touches its
+  target key and, when the cache is full, reclaims at most one extra entry: a due
+  heap root if one exists, otherwise the LRU tail. Expired entries can therefore
+  stay physically present until a read, a write that needs their slot, `Size()`,
+  or background cleanup removes them. `Size()` still purges every expired entry
+  at its sampling instant.
 - `SetExpire` uses seconds. With TTL enabled, a TTL <= 0 deletes the key immediately;
   excessively large TTLs are clamped to the maximum `time.Duration` (about 292 years).
   With TTL disabled, `SetExpire` behaves like `Set` and ignores the TTL.
@@ -64,12 +70,15 @@ deleting, evicting, renewing, or clearing entries cannot accumulate stale record
 Deadlines retain Go's monotonic time information.
 
 Lookup is O(1) for unexpired entries; removing an expired entry costs O(log n).
-Non-expiring mutations are O(1) excluding due-expiry purges. Expiring mutations
-cost O(log n). `Set`, `SetExpire`, and `Size` also purge due entries in
-O(k log n), where k entries have expired. An idle cleaner checks only the earliest
-deadline every 100ms. Each positive-capacity TTL cache owns one cleaner goroutine;
-Close waits for it to stop. Capacity does not bound the size of user payloads or
-the number of cache instances created by an application.
+A write inserts or cancels a TTL record in O(log n) and is otherwise O(1)
+excluding lock acquisition. A new key on a full cache reclaims exactly one entry
+— a due heap root when one exists, otherwise the LRU tail — in O(log n); writes
+no longer purge every due entry. `Size()` purges all due entries in O(k log n),
+where k entries have expired. Background cleanup still runs one goroutine per
+positive-capacity TTL cache and purges due entries; its current 100ms ticker may
+reclaim more than one entry at a time. Close waits for it to stop. Capacity does
+not bound the size of user payloads or the number of cache instances created by
+an application.
 
 ## Compatibility notes
 
