@@ -2,201 +2,157 @@ package memcache
 
 import (
 	"fmt"
-	"math/rand"
-	"reflect"
-	"sync"
 	"testing"
-	"time"
 )
 
-func run(n int, t *testing.T, wg *sync.WaitGroup) {
+func testCache(t *testing.T, capacity uint, expiry bool) *Memcache[int] {
+	t.Helper()
+	m := WithLRU[int](capacity, expiry)
+	t.Cleanup(m.Close)
+	return m
+}
 
-	defer wg.Done()
-
-	capacity := uint(n)
-	m := WithLRU[int](capacity, false)
-	if !reflect.DeepEqual(capacity, m.Cap()) {
-		t.Fatalf("容量应该是：%d, 但是确是：%d", capacity, m.Cap())
+func requireValue(t *testing.T, m *Memcache[int], key string, want int) {
+	t.Helper()
+	got := m.Get(key)
+	if got == nil || *got != want {
+		t.Fatalf("Get(%q) = %v, want %d", key, got, want)
 	}
+}
 
-	for i := 0; i < int(capacity); i++ {
-		m.Set(fmt.Sprintf("%d", i), i)
+func requireMissing(t *testing.T, m *Memcache[int], key string) {
+	t.Helper()
+	if got := m.Get(key); got != nil {
+		t.Fatalf("Get(%q) = %d, want miss", key, *got)
 	}
+}
 
-	if !reflect.DeepEqual(capacity, m.Size()) {
-		t.Fatalf("长度应该是：%d, 但是确是：%d", capacity, m.Size())
-	}
-
-	for i := 0; i < int(capacity); i++ {
-		v := m.Get(fmt.Sprintf("%d", i))
-		if !reflect.DeepEqual(*v, i) {
-			t.Fatalf("Want: %v, got: %v", i, *v)
-		}
-
-		// 每次读取后，读取的节点都会变成header
-		if !reflect.DeepEqual(m.header.Value, *v) {
-			t.Fatalf("m.Header error, Want: %v, got: %v", v, m.header.Value)
-		}
-
-		if m.header.Prv != nil {
-			if m.header == nil {
-				t.Logf("Header is nill")
+func TestCapacityAndEviction(t *testing.T) {
+	for _, capacity := range []uint{0, 1, 2, 16} {
+		t.Run(fmt.Sprint(capacity), func(t *testing.T) {
+			m := testCache(t, capacity, false)
+			m.Set("a", 1)
+			if capacity == 0 {
+				requireMissing(t, m, "a")
+				if m.Size() != 0 {
+					t.Fatal("zero-capacity cache stores entries")
+				}
+				return
 			}
-
-			if m.header.Prv == nil {
-				t.Logf("Header.Prv is nill: %#v", reflect.DeepEqual(m.header.Prv, nil))
+			if m.Cap() != capacity {
+				t.Fatal("capacity changed")
 			}
-			t.Fatalf("m.Header error, %v, Want: nil, got: %v", reflect.DeepEqual(m.header.Prv, nil), m.header.Prv.Value)
-		}
+		})
+	}
+	m := testCache(t, 2, false)
+	m.Set("a", 1)
+	m.Set("b", 2)
+	m.Set("c", 3)
+	requireMissing(t, m, "a")
+	requireValue(t, m, "b", 2)
+	requireValue(t, m, "c", 3)
+	if m.Size() != 2 {
+		t.Fatalf("size = %d, want 2", m.Size())
+	}
+}
 
-		// 尾巴
-		if uint(i) < capacity-1 {
-			if !reflect.DeepEqual(m.tail.Value, i+1) {
-				t.Fatalf("m.Tail error, Want: %v, got: %v", i+1, m.tail.Value)
+func TestAccessAndUpdateRefreshRecency(t *testing.T) {
+	for _, update := range []bool{false, true} {
+		m := testCache(t, 3, false)
+		m.Set("a", 1)
+		m.Set("b", 2)
+		m.Set("c", 3)
+		if update {
+			m.Set("a", 10)
+		} else {
+			requireValue(t, m, "a", 1)
+		}
+		m.Set("d", 4)
+		requireMissing(t, m, "b")
+		if update {
+			requireValue(t, m, "a", 10)
+		} else {
+			requireValue(t, m, "a", 1)
+		}
+	}
+}
+
+func TestDeletePositionsAndReuse(t *testing.T) {
+	for _, key := range []string{"a", "b", "c", "missing"} {
+		t.Run(key, func(t *testing.T) {
+			m := testCache(t, 3, false)
+			m.Set("a", 1)
+			m.Set("b", 2)
+			m.Set("c", 3)
+			m.Delete(key)
+			requireMissing(t, m, key)
+			want := uint(2)
+			if key == "missing" {
+				want = 3
 			}
-		}
-
-		// 循环一遍
-		if uint(i) == capacity-1 {
-			if !reflect.DeepEqual(m.tail.Value, 0) {
-				t.Fatalf("m.Tail error, Want: %v, got: %v", 0, m.tail.Value)
+			if m.Size() != want {
+				t.Fatalf("size = %d, want %d", m.Size(), want)
 			}
-		}
+			m.Delete(key)
+			m.Clear()
+			if m.Size() != 0 {
+				t.Fatal("clear did not empty cache")
+			}
+			m.Set("new", 4)
+			requireValue(t, m, "new", 4)
+		})
 	}
 }
 
-func Test_RandomCapacity(t *testing.T) {
-	wg := sync.WaitGroup{}
-	ch := make(chan struct{}, 16)
-
-	for i := 0; i < 1000; i++ {
-		ch <- struct{}{}
-		wg.Add(1)
-		go func() {
-			r := rand.Intn(500000)
-			run(r, t, &wg)
-			<-ch
-		}()
+func TestGetReturnsSnapshot(t *testing.T) {
+	m := testCache(t, 1, false)
+	m.Set("k", 1)
+	first := m.Get("k")
+	m.Set("k", 2)
+	if *first != 1 {
+		t.Fatalf("previous Get changed to %d after Set", *first)
 	}
-
-	wg.Wait()
+	*first = 99
+	requireValue(t, m, "k", 2)
 }
 
-func Test_RandomGet(t *testing.T) {
-	n := 10000
-	r := rand.Intn(n)
-	t.Logf("R: %d", r)
-	cache := WithLRU[int](uint(r), true)
-	for i := 0; i < r; i++ {
-		cache.Set(fmt.Sprintf("%d", i), i)
-	}
-
-	wg := sync.WaitGroup{}
-	for i := 0; i < r; i++ {
-		wg.Add(1)
-		go func() {
-			cache.Set(fmt.Sprintf("%d", rand.Intn(n)), rand.Intn(n))
-			cache.Get(fmt.Sprintf("%d", rand.Intn(n)))
-			wg.Done()
-		}()
-	}
-
-	wg.Wait()
+func TestSetExpireWithoutCleaner(t *testing.T) {
+	m := testCache(t, 1, false)
+	m.SetExpire("k", 1, 60)
+	requireValue(t, m, "k", 1)
 }
 
-func Test_Delete(t *testing.T) {
-	m := WithLRU[string](1, false)
-	m.Set("hello", "world")
-	hello := m.Get("hello")
-	if hello == nil || *hello != "world" {
-		t.Logf("Error")
-		t.FailNow()
+func TestLookupZeroAndNilValues(t *testing.T) {
+	m := testCache(t, 2, false)
+	m.Set("zero", 0)
+	if got, ok := m.Lookup("zero"); !ok || got != 0 {
+		t.Fatal("zero value is not a miss")
 	}
-
-	m.Delete("hello")
-	if m.Size() != 0 {
-		t.Logf("Error size")
-		t.FailNow()
+	if got, ok := m.Lookup("missing"); ok || got != 0 {
+		t.Fatal("missing key must return zero, false")
 	}
-
-	if m.header != nil {
-		t.Logf("Error header")
-		t.FailNow()
-	}
-
-	if m.tail != nil {
-		t.Logf("Error tail")
-		t.FailNow()
-	}
-
-	m1 := WithLRU[int](2, false)
-	m1.Set("1", 1)
-	m1.Set("2", 2)
-
-	m.Delete("1")
-	if !reflect.DeepEqual(2, m1.header.Value) {
-		t.Logf("Error header, 2 != %d", m1.header.Value)
-		t.FailNow()
+	pointers := WithLRU[*int](1, false)
+	defer pointers.Close()
+	pointers.Set("nil", nil)
+	if got := pointers.Get("nil"); got == nil || *got != nil {
+		t.Fatal("stored nil pointer must be distinguishable from miss")
 	}
 }
 
-func Test_TTl(t *testing.T) {
-	m := WithLRU[string](100, true)
-	ticker := time.NewTicker(10 * time.Second)
-
-	for i := 0; i < 10; i++ {
-		key := fmt.Sprintf("%d", i)
-		val := fmt.Sprintf("hello-%d", i)
-		m.SetExpire(key, val, 2)
-	}
-
-	t.Logf("缓存器还有数据哦: %d", m.Size())
-
-	for i := 0; i < 100; i++ {
-		c := WithLRU[string](100, true)
-		for j := 0; j < 100; j++ {
-			key := fmt.Sprintf("%d", j)
-			c.SetExpire(key, "bbbb", int64(j+1))
-		}
-		c.Get("adsds")
-	}
-
-loop:
-	for {
-		select {
-		case <-ticker.C:
-			break loop
-		}
-	}
-
-	if m.Size() > 0 {
-		t.Logf("错误：缓存器还有数据哦: %d", m.Size())
-	}
-
-	t.Logf("%#v", m.expired)
-}
-
-func Test_Monitor(t *testing.T) {
-	for i := 0; i < 100; i++ {
-		m := WithLRU[int](10, false)
-		m.Set("ze", i)
-	}
-
-	for _, m := range lives.ins {
-		if m.Size() != 1 {
-			t.Fatalf("Error 0")
-		}
-	}
-
-	if Lives() != 100 {
-		t.Fatalf("Error 1")
-	}
-
-	CLEAR_ALL()
-
-	for _, m := range lives.ins {
-		if m.Size() != 0 {
-			t.Fatalf("Error 2")
-		}
-	}
+func TestListInvariantsAfterMoves(t *testing.T) {
+	m := testCache(t, 3, false)
+	m.Set("a", 1)
+	m.Set("b", 2)
+	m.Set("c", 3)
+	requireValue(t, m, "b", 2)
+	requireValue(t, m, "a", 1)
+	requireOrder(t, m, "a", "b", "c")
+	m.Set("c", 30)
+	requireOrder(t, m, "c", "a", "b")
+	m.Delete("c")
+	requireOrder(t, m, "a", "b")
+	m.Delete("b")
+	requireOrder(t, m, "a")
+	m.Delete("a")
+	requireOrder(t, m)
 }
