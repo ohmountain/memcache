@@ -81,12 +81,18 @@ func makeWorkload(cfg workloadConfig, count int) ([]workloadOp, error) {
 // into miss scenarios.
 func workloadKey(i int) string { return "k" + strconv.Itoa(i) }
 
-// workloadReplayCount returns the replay cycle length for a capacity: at
-// large tiers the cycle must hold more distinct keys than the cache can
+// workloadReplayCount returns the replay cycle length for a workload config.
+// At large tiers the cycle must hold more distinct keys than the cache can
 // store, otherwise eviction scenarios silently degrade into overwrites of a
-// resident working set. The 1K tier keeps the plain 4096-op cycle.
-func workloadReplayCount(capacity int) int {
-	if count := 2 * capacity; count > workloadReplayOps {
+// resident working set. Scan replays exactly one full sweep of the key space:
+// with a key pool over 2x capacity the write share alone exceeds the cache,
+// so scans keep crossing the capacity boundary every cycle. The 1K tier keeps
+// the plain 4096-op cycle for uniform and zipf.
+func workloadReplayCount(cfg workloadConfig) int {
+	if cfg.Distribution == "scan" {
+		return cfg.KeyCount
+	}
+	if count := 2 * cfg.Capacity; count > workloadReplayOps {
 		return count
 	}
 	return workloadReplayOps
@@ -105,7 +111,7 @@ func TestWorkloadFullTierEvicts(t *testing.T) {
 					Distribution: distribution,
 					Seed:         workloadDefaultSeed,
 				}
-				ops, err := makeWorkload(cfg, workloadReplayCount(capacity))
+				ops, err := makeWorkload(cfg, workloadReplayCount(cfg))
 				if err != nil {
 					t.Fatal(err)
 				}

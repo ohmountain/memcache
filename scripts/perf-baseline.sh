@@ -151,10 +151,13 @@ case "$suite" in
           -cache-perf-case="$case_name" -cache-perf-instances="$n" -cache-perf-out="$task_perf_dir/${label}.json"
       done
     done
-    # 5. Lifecycle: scalar values and independent 4KiB payloads.
+    # 5. Lifecycle: scalar values and independent 4KiB payloads. These two
+    #    run with -v: their t.Logf lines (per-round heaps, the held/released
+    #    payload boundary) are part of the evidence and must survive in the
+    #    label log, not just on failure.
     for value in int bytes4k; do
       label="perf-lifecycle-${value}"
-      run_logged "$label" go test -run '^TestCachePerformance$' -count=1 -timeout=15m . -args \
+      run_logged "$label" go test -run '^TestCachePerformance$' -count=1 -v -timeout=15m . -args \
         -cache-perf-case=lifecycle -cache-perf-value="$value" -cache-perf-out="$task_perf_dir/${label}.json"
     done
     # 6. Profiles in separate processes; the kept test binaries stay in the

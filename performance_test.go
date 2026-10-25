@@ -145,6 +145,11 @@ type perfRecord struct {
 	WorkloadSHA256  string            `json:"workload_sha256"`
 	Load            loadResult        `json:"load"`
 	Resources       map[string]uint64 `json:"resources,omitempty"`
+	// ResourcesHeld carries the lifecycle bytes4k retention boundary: the
+	// same post-GC heap keys as Resources, sampled while payload references
+	// are still pinned by KeepAlive; Resources holds the after-release
+	// sample of the same heap.
+	ResourcesHeld map[string]uint64 `json:"resources_held,omitempty"`
 }
 
 // writePerfRecord creates path with O_EXCL: baseline evidence is written
@@ -376,7 +381,7 @@ func runNoopScenario(t *testing.T, base perfRecord) perfRecord {
 func runSteadyScenario(t *testing.T, base perfRecord) perfRecord {
 	cfg := perfLoadConfig()
 	wcfg := workloadConfig{Capacity: 1024, KeyCount: 2048, ReadPercent: 95, Distribution: "uniform", Seed: workloadDefaultSeed}
-	pattern, err := makeWorkload(wcfg, workloadReplayCount(1024))
+	pattern, err := makeWorkload(wcfg, workloadReplayCount(wcfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +532,7 @@ func TestCachePerformance(t *testing.T) {
 	case "idle-future":
 		record = runIdleScenario(t, base, true)
 	case "lifecycle":
-		record = runLifecycleScenario(t, base)
+		record = runLifecycleScenario(t, base, 10, 10)
 	default:
 		t.Fatalf("unknown -cache-perf-case %q", *perfCase)
 	}

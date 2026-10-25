@@ -12,9 +12,10 @@ import (
 // here once and reused by all later performance entry points.
 var cachePerfFull = flag.Bool("cache-perf-full", false, "run large cache performance scenarios (slow)")
 
-// workloadReplayOps is the pre-generated operation count every workload
-// benchmark replays cyclically; at 4096 it covers the 2048-key space of the
-// 1K tier twice per cycle at every distribution.
+// workloadReplayOps is the pre-generated operation count the uniform and
+// zipf workload benchmarks replay cyclically; at 4096 it covers the 2048-key
+// space of the 1K tier twice per cycle. Scan benchmarks replay one full key
+// space sweep instead (see workloadReplayCount).
 const workloadReplayOps = 4096
 
 // numericKeys returns the "0".."n-1" key pool shared by the plain
@@ -102,27 +103,34 @@ type workloadScenario struct {
 	distribution string
 }
 
+// workloadBenchmarkScenarios is the fixed benchmark mix table. Tests reuse
+// it so a scenario config change (for example the Scan50 key ratio) and its
+// regression assertions can never drift apart.
+var workloadBenchmarkScenarios = []workloadScenario{
+	{name: "Hit", preload: true, keyRatio: 1, readPercent: 100, distribution: "uniform"},
+	{name: "Miss", keyRatio: 2, readPercent: 100, distribution: "uniform"},
+	{name: "Overwrite", preload: true, keyRatio: 1, distribution: "uniform"},
+	{name: "InsertEvict", preload: true, keyRatio: 2, distribution: "uniform"},
+	{name: "Uniform95", preload: true, keyRatio: 2, readPercent: 95, distribution: "uniform"},
+	{name: "Zipf95", preload: true, keyRatio: 2, readPercent: 95, distribution: "zipf"},
+	// The 4x key pool keeps the write half at 2x capacity, so the one-sweep
+	// replay crosses the capacity boundary every cycle; at 2x the write half
+	// would exactly equal capacity and settle into pure overwrites.
+	{name: "Scan50", preload: true, keyRatio: 4, readPercent: 50, distribution: "scan"},
+	{name: "RenewTTL", ttl: true, renew: true, preload: true, keyRatio: 1, distribution: "uniform"},
+}
+
 // BenchmarkCacheWorkload replays pre-generated deterministic mixes. Keys and
 // operations are built before the timer; hit or miss is decided by the
 // fixture (preload), never by an extra timed Lookup. Parallel workers index
 // the operation slice with their own counters and sum read results locally.
 func BenchmarkCacheWorkload(b *testing.B) {
-	bases := []workloadScenario{
-		{name: "Hit", preload: true, keyRatio: 1, readPercent: 100, distribution: "uniform"},
-		{name: "Miss", keyRatio: 2, readPercent: 100, distribution: "uniform"},
-		{name: "Overwrite", preload: true, keyRatio: 1, distribution: "uniform"},
-		{name: "InsertEvict", preload: true, keyRatio: 2, distribution: "uniform"},
-		{name: "Uniform95", preload: true, keyRatio: 2, readPercent: 95, distribution: "uniform"},
-		{name: "Zipf95", preload: true, keyRatio: 2, readPercent: 95, distribution: "zipf"},
-		{name: "Scan50", preload: true, keyRatio: 2, readPercent: 50, distribution: "scan"},
-		{name: "RenewTTL", ttl: true, renew: true, preload: true, keyRatio: 1, distribution: "uniform"},
-	}
 	capacities := []int{1024}
 	if *cachePerfFull {
 		capacities = append(capacities, 100000, 1000000)
 	}
 	for _, capacity := range capacities {
-		for _, scenario := range bases {
+		for _, scenario := range workloadBenchmarkScenarios {
 			scenario, capacity := scenario, capacity
 			cfg := workloadConfig{
 				Capacity:     capacity,
@@ -144,7 +152,7 @@ func BenchmarkCacheWorkload(b *testing.B) {
 
 func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadConfig, parallel bool) {
 	b.Helper()
-	ops, err := makeWorkload(cfg, workloadReplayCount(cfg.Capacity))
+	ops, err := makeWorkload(cfg, workloadReplayCount(cfg))
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -221,5 +229,62 @@ func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadC
 	// Same as above: keep the timed reads observable.
 	if reads == -1 {
 		b.Fatal("unreachable")
+	}
+}
+
+// TestWorkloadScanSustainsEviction pins the Scan50 benchmark premise across
+// warmup: every replayed cycle must keep missing (and therefore evicting)
+// after the preload and the first cycle have warmed the cache. The failure
+// mode it guards against is the write half settling into overwrites of a
+// fully resident key set, which silently turns the scan benchmark into an
+// overwrite benchmark. (The extra pre-write Lookups run in this test only,
+// never inside the benchmark.)
+func TestWorkloadScanSustainsEviction(t *testing.T) {
+	var scenario workloadScenario
+	for _, s := range workloadBenchmarkScenarios {
+		if s.name == "Scan50" {
+			scenario = s
+		}
+	}
+	if scenario.name == "" {
+		t.Fatal("Scan50 scenario missing from the benchmark table")
+	}
+	for _, capacity := range []int{1024, 100000} {
+		cfg := workloadConfig{
+			Capacity:     capacity,
+			KeyCount:     scenario.keyRatio * capacity,
+			ReadPercent:  scenario.readPercent,
+			Distribution: scenario.distribution,
+			Seed:         workloadDefaultSeed,
+		}
+		ops, err := makeWorkload(cfg, workloadReplayCount(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := WithLRU[int](uint(capacity), false)
+		t.Cleanup(m.Close)
+		preload := cfg.KeyCount
+		if preload > capacity {
+			preload = capacity
+		}
+		for i := 0; i < preload; i++ {
+			m.Set(workloadKey(i), i)
+		}
+		for cycle := 0; cycle < 3; cycle++ {
+			misses := 0
+			for _, op := range ops {
+				if op.Read {
+					continue
+				}
+				if _, ok := m.Lookup(op.Key); !ok {
+					misses++
+				}
+				m.Set(op.Key, cycle)
+			}
+			if cycle > 0 && misses < capacity/2 {
+				t.Fatalf("cap %d cycle %d: only %d of %d writes missed after warmup; the scan replay degraded into overwrites", capacity, cycle, misses, len(ops)/2)
+			}
+			t.Logf("cap %d cycle %d: %d write misses across %d ops", capacity, cycle, misses, len(ops))
+		}
 	}
 }

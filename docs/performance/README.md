@@ -55,6 +55,14 @@ steady reports 0 because its TTL-less cache starts no cleaner); always
 disambiguate via the `case` field. Non-applicable keys are omitted — a
 missing key never means zero.
 
+The lifecycle bytes4k run additionally carries `resources_held`: the same
+post-GC heap keys as `resources`, sampled while the payload references are
+still pinned (`runtime.KeepAlive`), where `resources` holds the after-release
+sample of the same heap. The distance between the two maps is the retained
+payload footprint; the per-round logs behind them are preserved by running
+the two lifecycle commands with `go test -v` (see `scripts/perf-baseline.sh`)
+so the label logs carry the full trail, not just a final `ok`.
+
 ## Reading the numbers honestly
 
 - Latency runs from the **planned** arrival time to completion: queueing and

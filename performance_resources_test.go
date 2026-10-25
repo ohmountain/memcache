@@ -156,18 +156,20 @@ func runIdleScenario(t *testing.T, base perfRecord, future bool) perfRecord {
 	return base
 }
 
-// runLifecycleScenario creates, fills, and closes 10 rounds of 10 TTL
+// runLifecycleScenario creates, fills, and closes rounds of perRound TTL
 // caches of capacity 1024, reporting per-round resource logs and aggregate
 // resources. The bytes4k variant stores one pre-allocated 4KiB slice per
 // entry; payload references stay held during the rounds, then a final GC
-// after releasing them delineates payload versus metadata retention.
-func runLifecycleScenario(t *testing.T, base perfRecord) perfRecord {
+// after releasing them delineates payload versus metadata retention. Both
+// phases persist in the record: resources_held (payloads pinned) and
+// resources (after release).
+func runLifecycleScenario(t *testing.T, base perfRecord, rounds, perRound int) perfRecord {
 	switch *perfValue {
 	case "int", "bytes4k":
 	default:
 		t.Fatalf("-cache-perf-value must be int or bytes4k for lifecycle, got %q", *perfValue)
 	}
-	const rounds, perRound, capacity = 10, 10, 1024
+	const capacity = 1024
 	before := Lives()
 	base.ValueType = *perfValue
 	base.Capacity = capacity
@@ -235,6 +237,10 @@ func runLifecycleScenario(t *testing.T, base perfRecord) perfRecord {
 		retained = nil
 		allocFreed, objectsFreed := readHeapStats()
 		t.Logf("payload boundary: held alloc=%d objects=%d; released alloc=%d objects=%d", allocHeld, objectsHeld, allocFreed, objectsFreed)
+		base.ResourcesHeld = map[string]uint64{
+			"heap_alloc_bytes": allocHeld,
+			"heap_objects":     objectsHeld,
+		}
 		base.Resources = map[string]uint64{
 			"heap_alloc_bytes": allocFreed,
 			"heap_objects":     objectsFreed,
@@ -257,4 +263,48 @@ func runLifecycleScenario(t *testing.T, base perfRecord) perfRecord {
 	base.Resources["reclaim_duration_ns"] = uint64(closeTotal.Nanoseconds())
 	t.Logf("lifecycle total close time: %v across %d rounds", closeTotal, rounds)
 	return base
+}
+
+// TestLifecycleScenarioRecordsPayloadBoundary pins the evidence contract of
+// the bytes4k lifecycle run: both heap phases must land in the record — the
+// held sample taken while payload references are pinned and the after-release
+// sample — with the payload bytes visibly between them. The int variant
+// makes no payload claim, so it carries no held map.
+func TestLifecycleScenarioRecordsPayloadBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		value      string
+		wantHeld   bool
+		payloadMiB uint64
+	}{
+		{value: "int", wantHeld: false},
+		{value: "bytes4k", wantHeld: true, payloadMiB: 36}, // 3*3*1024*4KiB ≈ 36 MiB
+	} {
+		old := *perfValue
+		*perfValue = tc.value
+		record := runLifecycleScenario(t, perfRecord{}, 3, 3)
+		*perfValue = old
+		if !tc.wantHeld {
+			if record.ResourcesHeld != nil {
+				t.Fatalf("%s variant recorded resources_held=%v; no payload boundary applies", tc.value, record.ResourcesHeld)
+			}
+			continue
+		}
+		if record.ResourcesHeld == nil || record.Resources == nil {
+			t.Fatalf("%s variant lost a heap phase: held=%v released=%v", tc.value, record.ResourcesHeld, record.Resources)
+		}
+		for _, key := range []string{"heap_alloc_bytes", "heap_objects"} {
+			if _, ok := record.ResourcesHeld[key]; !ok {
+				t.Fatalf("held phase missing %s: %v", key, record.ResourcesHeld)
+			}
+			if _, ok := record.Resources[key]; !ok {
+				t.Fatalf("released phase missing %s: %v", key, record.Resources)
+			}
+		}
+		held := record.ResourcesHeld["heap_alloc_bytes"]
+		released := record.Resources["heap_alloc_bytes"]
+		if held < released+tc.payloadMiB<<20/2 {
+			t.Fatalf("payload boundary vanished: held=%d released=%d, want held to exceed released by at least %d MiB", held, released, tc.payloadMiB/2)
+		}
+		t.Logf("%s boundary: held=%d released=%d bytes", tc.value, held, released)
+	}
 }
