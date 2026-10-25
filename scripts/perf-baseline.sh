@@ -129,7 +129,7 @@ case "$suite" in
     ;;
   full)
     # 1. Micro benchmarks: 10 repetitions across CPU counts, large scenarios on.
-    run_logged bench-full go test -run='^$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload|BenchmarkCachePayload)$' -benchmem -cpu=1,2,4,8 -benchtime=200ms -count=10 -timeout=30m ./... -args -cache-perf-full=true
+    run_logged bench-full go test -run='^$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload|BenchmarkCachePayload)$' -benchmem -cpu=1,2,4,8 -benchtime=200ms -count=10 -timeout=45m ./... -args -cache-perf-full=true
     # 2. First post-expiry operation per fresh fixture (one iteration each).
     run_logged bench-expiry go test -run='^$' -bench='^BenchmarkCacheExpiry$' -benchmem -benchtime=1x -count=10 -timeout=10m ./... -args -cache-perf-full=true
     # 3. Open-loop scenarios: five cases x three rates x ten repetitions.

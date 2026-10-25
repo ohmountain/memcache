@@ -33,7 +33,7 @@ bench:
 # bench-full adds the 100K/1M-capacity scenarios behind -cache-perf-full and
 # repeats every micro benchmark 10 times across CPU counts for benchstat.
 bench-full:
-	$(GO) test -run='^$$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload|BenchmarkCachePayload)$$' -benchmem -cpu=1,2,4,8 -benchtime=200ms -count=10 -timeout=30m ./... -args -cache-perf-full=true
+	$(GO) test -run='^$$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload|BenchmarkCachePayload)$$' -benchmem -cpu=1,2,4,8 -benchtime=200ms -count=10 -timeout=45m ./... -args -cache-perf-full=true
 
 # bench-expiry measures one post-expiry operation per fresh fixture; the
 # adaptive b.N loop would refill 100K/1M caches, so it requires -benchtime=1x.

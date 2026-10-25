@@ -144,7 +144,7 @@ func BenchmarkCacheWorkload(b *testing.B) {
 
 func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadConfig, parallel bool) {
 	b.Helper()
-	ops, err := makeWorkload(cfg, workloadReplayOps)
+	ops, err := makeWorkload(cfg, workloadReplayCount(cfg.Capacity))
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -81,6 +81,79 @@ func makeWorkload(cfg workloadConfig, count int) ([]workloadOp, error) {
 // into miss scenarios.
 func workloadKey(i int) string { return "k" + strconv.Itoa(i) }
 
+// workloadReplayCount returns the replay cycle length for a capacity: at
+// large tiers the cycle must hold more distinct keys than the cache can
+// store, otherwise eviction scenarios silently degrade into overwrites of a
+// resident working set. The 1K tier keeps the plain 4096-op cycle.
+func workloadReplayCount(capacity int) int {
+	if count := 2 * capacity; count > workloadReplayOps {
+		return count
+	}
+	return workloadReplayOps
+}
+
+// TestWorkloadFullTierEvicts pins the eviction premise behind the scaled
+// replay counts: replaying one cycle of a write-only workload over a
+// 2x-capacity key pool must evict most of the preloaded entries.
+func TestWorkloadFullTierEvicts(t *testing.T) {
+	for _, capacity := range []int{1024, 100000} {
+		for _, distribution := range []string{"uniform", "scan"} {
+			t.Run(fmt.Sprintf("%s-cap%d", distribution, capacity), func(t *testing.T) {
+				cfg := workloadConfig{
+					Capacity:     capacity,
+					KeyCount:     2 * capacity,
+					Distribution: distribution,
+					Seed:         workloadDefaultSeed,
+				}
+				ops, err := makeWorkload(cfg, workloadReplayCount(capacity))
+				if err != nil {
+					t.Fatal(err)
+				}
+				m := WithLRU[int](uint(capacity), false)
+				t.Cleanup(m.Close)
+				preloaded := make(map[string]bool, capacity)
+				for i := 0; i < capacity; i++ {
+					key := workloadKey(i)
+					m.Set(key, i)
+					preloaded[key] = true
+				}
+				// A write to a key that is not resident forces an insert and
+				// an eviction once the cache is full; counting them proves
+				// the cycle keeps crossing the capacity boundary. (The extra
+				// Lookup runs in this test only, never in the benchmark.)
+				misses := 0
+				for _, op := range ops {
+					if _, ok := m.Lookup(op.Key); !ok {
+						misses++
+					}
+					m.Set(op.Key, 0)
+				}
+				snap := snapshotCache(m)
+				if len(snap.Items) != capacity {
+					t.Fatalf("cache holds %d of %d slots", len(snap.Items), capacity)
+				}
+				if misses < capacity/4 {
+					t.Fatalf("%s: only %d of %d writes missed the full cache", distribution, misses, len(ops))
+				}
+				if distribution == "scan" {
+					// A sequential sweep leaves none of the preloaded head
+					// keys resident.
+					survivors := 0
+					for key := range snap.Items {
+						if preloaded[key] {
+							survivors++
+						}
+					}
+					if survivors != 0 {
+						t.Fatalf("scan left %d preloaded keys resident", survivors)
+					}
+				}
+				t.Logf("%s cap %d: %d misses across %d writes", distribution, capacity, misses, len(ops))
+			})
+		}
+	}
+}
+
 func TestWorkloadDeterministic(t *testing.T) {
 	cfg := workloadConfig{Capacity: 1024, KeyCount: 2048, ReadPercent: 95, Distribution: "uniform", Seed: 20261025}
 	first, err := makeWorkload(cfg, 100)

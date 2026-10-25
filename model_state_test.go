@@ -478,6 +478,25 @@ const modelLargeSteps = 4096
 
 func TestModelLargeSequences(t *testing.T) {
 	const seed = int64(20261025)
+	// Weighted kind pool: write-heavy so large state actually accumulates.
+	// Destructive ops are placed deterministically instead of weighted — a
+	// weighted Clear (or an early Close) would keep wiping the cache and the
+	// steps would never exercise large-state behavior: one Clear early, so
+	// the rest of the run refills past capacity, and Close only in the tail.
+	const closeSegment = 64
+	kindPool := make([]uint8, 0, 1000)
+	add := func(kind uint8, weight int) {
+		for i := 0; i < weight; i++ {
+			kindPool = append(kindPool, kind)
+		}
+	}
+	add(0, 330) // Set
+	add(1, 320) // SetExpire
+	add(2, 200) // Lookup
+	add(7, 50)  // Get
+	add(3, 20)  // Delete
+	add(5, 40)  // Advance
+	add(6, 40)  // Clean
 	for _, config := range []struct {
 		capacity uint
 		ttl      bool
@@ -485,13 +504,27 @@ func TestModelLargeSequences(t *testing.T) {
 		t.Run(fmt.Sprintf("capacity=%d,ttl=%v", config.capacity, config.ttl), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
 			ops := make([]modelOp, 0, modelLargeSteps)
+			// Key pool of 1.25x capacity: still beyond capacity so eviction
+			// keeps happening, but tight enough that writes fill the cache.
+			keySpace := int(config.capacity) + int(config.capacity)/4
 			for i := 0; i < modelLargeSteps; i++ {
-				key := strconv.Itoa(rng.Intn(2 * int(config.capacity)))
+				key := strconv.Itoa(rng.Intn(keySpace))
 				op := modelOp{Key: key, Value: rng.Intn(1000)}
-				op.Kind = uint8(rng.Intn(10))
+				switch {
+				case i == modelLargeSteps/16:
+					op.Kind = 4 // one early Clear; the run refills after it
+				case i >= modelLargeSteps-closeSegment && (i-(modelLargeSteps-closeSegment))%16 == 0:
+					op.Kind = 9
+				default:
+					op.Kind = kindPool[rng.Intn(len(kindPool))]
+				}
 				switch op.Kind {
 				case 1:
-					op.TTL = int64(rng.Intn(8)) - 1
+					if rng.Intn(8) == 0 {
+						op.TTL = int64(rng.Intn(8)) - 1
+					} else {
+						op.TTL = 3600
+					}
 				case 5:
 					op.Advance = time.Duration(rng.Intn(5)+1) * time.Second
 				}
@@ -506,7 +539,19 @@ func TestModelLargeSequences(t *testing.T) {
 					t.Logf("seed=%d config=%+v operation prefix: %+v", seed, config, prefix)
 				}
 			})
-			runModelSequence(t, config.capacity, config.ttl, ops)
+			m, clock, model := newModelSequenceFixture(t, config.capacity, config.ttl)
+			peak := 0
+			for step, op := range ops {
+				_, snap := stepModelOp(t, step, m, clock, model, op)
+				if live := len(snap.Items); live > peak {
+					peak = live
+				}
+			}
+			// The sequence must actually exercise a large cache; with the
+			// fixed seed the write mix fills it well past three quarters.
+			if peak < int(config.capacity)*3/4 {
+				t.Fatalf("peak physical size %d never approached capacity %d", peak, config.capacity)
+			}
 		})
 	}
 }

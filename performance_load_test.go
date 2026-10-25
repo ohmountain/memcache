@@ -160,7 +160,6 @@ func runOpenLoop(ctx context.Context, cfg loadConfig, start time.Time, clock loa
 	}
 	inBurst := func(id uint64) bool { return plannedTime(id).Sub(start) < cfg.BurstWindow }
 
-	begin := clock.Now()
 	queue := make(chan uint64, cfg.Queue)
 	latencies := make([]time.Duration, planned)
 	completedFlags := make([]bool, planned)
@@ -223,7 +222,11 @@ func runOpenLoop(ctx context.Context, cfg loadConfig, start time.Time, clock loa
 	<-schedulerDone
 	wg.Wait()
 
-	result := loadResult{Planned: planned, Elapsed: clock.Now().Sub(begin)}
+	// Elapsed covers the load window — planned start to completion of the
+	// joins — so a future start (for example an expiry deadline one second
+	// out) does not inflate it with pre-load waiting and computed
+	// throughput is not silently understated.
+	result := loadResult{Planned: planned, Elapsed: clock.Now().Sub(start)}
 	var all, burst, set, burstSet []time.Duration
 	for id := 0; id < planned; id++ {
 		burstMember := inBurst(uint64(id))
@@ -362,6 +365,15 @@ func (c *fakeLoadClock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.now
+}
+
+// parkedWaiters reports how many WaitUntil calls are currently parked.
+// Tests poll it to confirm the scheduler has reached (and parked at) its
+// first target.
+func (c *fakeLoadClock) parkedWaiters() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.waiters)
 }
 
 func (c *fakeLoadClock) WaitUntil(ctx context.Context, target time.Time) error {
@@ -635,6 +647,42 @@ func TestOpenLoopSeparatesSetLatency(t *testing.T) {
 	}
 	if result.All.Samples != 4 || result.All.P99 != 10*time.Millisecond {
 		t.Fatalf("all latency = %+v", result.All)
+	}
+}
+
+// TestOpenLoopElapsedMeasuresLoadWindow pins that Elapsed covers the load
+// window from the planned start, not the pre-start wait for a future start.
+func TestOpenLoopElapsedMeasuresLoadWindow(t *testing.T) {
+	base := modelEpoch
+	clock := newFakeLoadClock(base)
+	start := base.Add(500 * time.Millisecond)
+	cfg := loadConfig{Rate: 1000, Duration: 2 * time.Millisecond, Workers: 1, Queue: 8, BurstWindow: 2 * time.Millisecond}
+	done := make(chan struct{})
+	var result loadResult
+	var err error
+	go func() {
+		defer close(done)
+		result, err = runOpenLoop(context.Background(), cfg, start, clock, func(uint64) loadOutcome {
+			return loadOutcome{}
+		})
+	}()
+	// Wait until the scheduler has parked on its first target (runOpenLoop
+	// sampled its begin time before spawning it), then release both planned
+	// requests at once.
+	limit := time.Now().Add(5 * time.Second)
+	for clock.parkedWaiters() == 0 && time.Now().Before(limit) {
+		time.Sleep(time.Millisecond)
+	}
+	if clock.parkedWaiters() == 0 {
+		t.Fatal("scheduler never parked on its first target")
+	}
+	clock.AdvanceTo(start.Add(time.Millisecond))
+	<-done
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Elapsed != time.Millisecond {
+		t.Fatalf("elapsed = %v, want the 1ms load window (not the 500ms pre-start wait)", result.Elapsed)
 	}
 }
 

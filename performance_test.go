@@ -268,6 +268,20 @@ func buildCacheActions(cfg workloadConfig, count int, readKeys, writeKeys []stri
 	return actions, nil
 }
 
+// patternActions converts a generated workload pattern directly, keeping
+// the generated keys and therefore the requested distribution intact.
+func patternActions(pattern []workloadOp) []cacheAction {
+	actions := make([]cacheAction, len(pattern))
+	for i, op := range pattern {
+		if op.Read {
+			actions[i] = cacheAction{Key: op.Key, Kind: 0}
+		} else {
+			actions[i] = cacheAction{Key: op.Key, Kind: 1}
+		}
+	}
+	return actions
+}
+
 func actionsSHA256(actions []cacheAction) string {
 	digest := sha256.New()
 	for _, action := range actions {
@@ -362,13 +376,16 @@ func runNoopScenario(t *testing.T, base perfRecord) perfRecord {
 func runSteadyScenario(t *testing.T, base perfRecord) perfRecord {
 	cfg := perfLoadConfig()
 	wcfg := workloadConfig{Capacity: 1024, KeyCount: 2048, ReadPercent: 95, Distribution: "uniform", Seed: workloadDefaultSeed}
+	pattern, err := makeWorkload(wcfg, workloadReplayCount(1024))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The control scenario keeps the generated keys, so its uniform
+	// distribution stays uniform; only the preload fixture is fixed.
+	actions := patternActions(pattern)
 	keys := make([]string, 2048)
 	for i := range keys {
 		keys[i] = workloadKey(i)
-	}
-	actions, err := buildCacheActions(wcfg, workloadReplayOps, keys, keys, false)
-	if err != nil {
-		t.Fatal(err)
 	}
 	before := Lives()
 	m := WithLRU[int](1024, false)

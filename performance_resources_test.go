@@ -135,7 +135,14 @@ func runIdleScenario(t *testing.T, base perfRecord, future bool) perfRecord {
 	if future {
 		base.InitialExpiring = *perfInstances
 	}
-	base.Load = runLoadOnceAt(t, cfg, time.Now(), func(uint64) loadOutcome { return loadOutcome{} })
+	windowStart := time.Now()
+	base.Load = runLoadOnceAt(t, cfg, windowStart, func(uint64) loadOutcome { return loadOutcome{} })
+	// The last 1 rps request is planned 2s into the 3s window, so the load
+	// alone would stop there; hold the full observation window open before
+	// sampling resources and ticker checks.
+	if remain := time.Until(windowStart.Add(cfg.Duration)); remain > 0 {
+		time.Sleep(remain)
+	}
 	heapAlloc, heapObjects := readHeapStats()
 	base.Resources = map[string]uint64{
 		"heap_alloc_bytes":  heapAlloc,
@@ -221,6 +228,10 @@ func runLifecycleScenario(t *testing.T, base perfRecord) perfRecord {
 			t.Logf("round %d closed with payloads retained: heap_alloc=%d heap_objects=%d retained_payloads=%d", round, alloc, objects, len(retained))
 		}
 		allocHeld, objectsHeld := readHeapStats()
+		// KeepAlive pins the payloads through the held sampling: without it
+		// the compiler may already consider retained dead and GC could
+		// collect the payloads before the "held" numbers are read.
+		runtime.KeepAlive(retained)
 		retained = nil
 		allocFreed, objectsFreed := readHeapStats()
 		t.Logf("payload boundary: held alloc=%d objects=%d; released alloc=%d objects=%d", allocHeld, objectsHeld, allocFreed, objectsFreed)
