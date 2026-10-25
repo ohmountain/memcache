@@ -19,10 +19,13 @@ type cacheState[T CacheAble] struct {
 	order         *list.List
 	expiry        expiryHeap[T]
 	enableExpired bool
-	now           func() time.Time
-	closed        bool
-	done          chan struct{}
-	stopped       chan struct{}
+	// clock is the single time source: now is its deadline function and
+	// clock.Now drives scheduling, so both read the same injected clock.
+	clock   cacheClock
+	now     func() time.Time
+	closed  bool
+	done    chan struct{}
+	stopped chan struct{}
 }
 
 func (s *cacheState[T]) set(key string, value T, ttl int64, expiring bool) {

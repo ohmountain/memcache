@@ -23,12 +23,19 @@ func WithLRU[T CacheAble](capacity uint, enableExpired bool) *Memcache[T] {
 
 // The clock and cleaner switch allow deterministic TTL tests without sleeps.
 func newMemcache[T CacheAble](capacity uint, enableExpired bool, now func() time.Time, startCleaner bool) *Memcache[T] {
+	return newMemcacheWithClock[T](capacity, enableExpired, systemClock{now: now}, startCleaner)
+}
+
+// newMemcacheWithClock is the shared constructor: the injected clock supplies
+// both deadline reads (state.now) and cleaner scheduling (state.clock).
+func newMemcacheWithClock[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool) *Memcache[T] {
 	s := &cacheState[T]{
 		capacity:      capacity,
 		holder:        make(map[string]*node[T]),
 		order:         list.New(),
 		enableExpired: enableExpired,
-		now:           now,
+		clock:         clock,
+		now:           clock.Now,
 		done:          make(chan struct{}),
 		stopped:       make(chan struct{}),
 	}
