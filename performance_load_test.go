@@ -194,11 +194,14 @@ func runOpenLoop(ctx context.Context, cfg loadConfig, start time.Time, clock loa
 	schedulerDone := make(chan struct{})
 	var runErr error
 	go func() {
-		defer close(schedulerDone)
-		defer close(queue)
+		// Defer LIFO: the queue closes first, then schedulerDone, then the
+		// issue-done hook — so the hook really runs after every enqueue
+		// attempt and the queue close complete.
 		if issueDone := openLoopIssueDone; issueDone != nil {
 			defer issueDone()
 		}
+		defer close(schedulerDone)
+		defer close(queue)
 		select {
 		case <-ctx.Done():
 			runErr = ctx.Err()

@@ -45,6 +45,16 @@ case "$suite" in
 esac
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Verify the runtime files BEFORE creating anything, so a refused run leaves
+# no output directory behind to block a retry with the same --out.
+cd "$repo_root"
+if ! git diff --quiet "$RUNTIME_BASELINE" -- "${RUNTIME_FILES[@]}"; then
+  echo "runtime files differ from baseline $RUNTIME_BASELINE; refusing to measure" >&2
+  git diff "$RUNTIME_BASELINE" -- "${RUNTIME_FILES[@]}" >&2 || true
+  exit 1
+fi
+
 if [ -z "$out" ]; then
   out="$(mktemp -d "${TMPDIR:-/tmp}/memcache-perf-XXXXXX")"
 else
@@ -56,13 +66,6 @@ else
 fi
 out="$(cd "$out" && pwd)"
 echo "results directory: $out (suite=$suite)"
-
-cd "$repo_root"
-if ! git diff --quiet "$RUNTIME_BASELINE" -- "${RUNTIME_FILES[@]}"; then
-  echo "runtime files differ from baseline $RUNTIME_BASELINE; refusing to measure" >&2
-  git diff "$RUNTIME_BASELINE" -- "${RUNTIME_FILES[@]}" >&2 || true
-  exit 1
-fi
 
 manifest="$out/manifest.txt"
 : >"$manifest"
@@ -76,8 +79,20 @@ record "runtime_files_match_baseline=yes"
 record "git_dirty=$(if git diff --quiet && git diff --cached --quiet; then echo no; else echo yes; fi)"
 record "seed=$SEED"
 record "go_version=$(go version)"
-# go env never modifies the environment; its output documents the toolchain.
-go env GOOS GOARCH GOMAXPROCS GOVERSION CC >>"$manifest" 2>&1 || true
+# Labeled env records: plain `go env GOMAXPROCS` prints a blank line when
+# unset, so record the env var and the machine CPU count explicitly. Every
+# perf/*.json also carries the per-run effective gomaxprocs.
+record "env_goos=$(go env GOOS)"
+record "env_goarch=$(go env GOARCH)"
+record "env_go_version=$(go env GOVERSION)"
+record "env_cc=$(go env CC)"
+record "gomaxprocs_env=${GOMAXPROCS-<unset: runtime default = cpu_count>}"
+case "$(uname -s)" in
+  Darwin) cpu_count="$(sysctl -n hw.ncpu 2>/dev/null || echo unknown)" ;;
+  Linux) cpu_count="$(nproc 2>/dev/null || echo unknown)" ;;
+  *) cpu_count=unknown ;;
+esac
+record "cpu_count=$cpu_count"
 record "uname=$(uname -a)"
 case "$(uname -s)" in
   Darwin)
@@ -158,12 +173,14 @@ esac
 
 record "finished_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-# SHA256 inventory of every produced file (checksums use the first available tool).
+# SHA256 inventory of every produced file except the manifest itself: its
+# final line is appended after hashing, so a self-checksum could never be
+# current (checksums use the first available tool).
 hash_tool=sha256sum
 command -v sha256sum >/dev/null 2>&1 || hash_tool="shasum -a 256"
 (
   cd "$out"
-  find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 $hash_tool >SHA256SUMS
+  find . -type f ! -name SHA256SUMS ! -name manifest.txt -print0 | sort -z | xargs -0 $hash_tool >SHA256SUMS
 )
 record "files_hashed=$(find "$out" -type f ! -name SHA256SUMS | wc -l | tr -d ' ')"
 echo "done: $out"

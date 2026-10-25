@@ -47,8 +47,8 @@ func BenchmarkCacheExpiry(b *testing.B) {
 					b.Skipf("requires exactly one iteration, got N=%d; use -benchtime=1x", b.N)
 				}
 				m, clock := prepareExpiryBenchmark(b, capacity)
-				b.ResetTimer()
 				clock.Advance(time.Second)
+				b.ResetTimer()
 				switch target {
 				case "FirstSet":
 					m.Set("new", 1)

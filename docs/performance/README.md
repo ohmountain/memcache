@@ -47,6 +47,13 @@ them before trusting it:
   planned inside `[start, start+burst_window)`.
 - `all.samples == completed`; `set.*` summarizes only `Write` samples.
 
+The fixed `resources` keys are case-dependent: `reclaim_duration_ns` means
+expired-entry reclamation time in the expiry scenarios but total Close time
+in `lifecycle`; `owned_workers` is recorded when the run owns cache
+instances with a meaningful worker count (idle and lifecycle); always
+disambiguate via the `case` field. Non-applicable keys are omitted — a
+missing key never means zero.
+
 ## Reading the numbers honestly
 
 - Latency runs from the **planned** arrival time to completion: queueing and

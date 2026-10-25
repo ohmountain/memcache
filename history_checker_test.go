@@ -49,7 +49,7 @@ func historyResultMatches(event historyEvent, got modelResult) bool {
 // is exhausted, and "inconclusive" for malformed input, more than eight
 // events, or an exhausted state budget (the root counts as one state).
 func checkHistory(initial *cacheModel, events []historyEvent, final *cacheSnapshot, maxStates int) (historyVerdict, []int) {
-	if maxStates <= 0 || len(events) == 0 || len(events) > historyMaxEvents {
+	if initial == nil || maxStates <= 0 || len(events) == 0 || len(events) > historyMaxEvents {
 		return historyInconclusive, nil
 	}
 	seen := make(map[int]bool, len(events))
@@ -225,6 +225,10 @@ func TestHistoryRejectsMalformedEvents(t *testing.T) {
 				t.Fatalf("verdict = %q witness = %v, want inconclusive", v, witness)
 			}
 		})
+	}
+	// A nil initial model is malformed input, never a panic.
+	if v, witness := checkHistory(nil, base, nil, 100000); v != historyVerdict("inconclusive") || witness != nil {
+		t.Fatalf("nil model: verdict = %q witness = %v, want inconclusive", v, witness)
 	}
 	// More than eight operations are refused outright.
 	var tooMany []historyEvent
