@@ -37,10 +37,10 @@
 - `make bench` passed. Local scalar Lookup used 0 allocations and Get used 1 allocation, as expected for its snapshot pointer.
 - Official checksum-verified Go 1.18.10 darwin/arm64: `CGO_ENABLED=0 go test -count=1 -timeout=60s ./...` and `go vet ./...` passed.
 - Go 1.27 test binaries cross-compiled for Linux/amd64 and Windows/amd64 with CGO disabled; they were not executed on those operating systems.
-- At the time of the pre-release local review, workflow YAML parsed successfully; remote CI had not run and changes had not yet been committed or pushed.
+- At the time of the local review, workflow YAML parsed successfully; remote CI had not run and changes had not yet been committed or pushed.
 
-## Release preparation
+## Contribution delivery
 
-- Publish the first fork release as `v0.1.0`; the remote repository had no tags or releases.
-- Set the module and example imports to `github.com/infinitete/memcache` so the fork's tag can be consumed directly with Go modules.
+- Keep the upstream module and example imports at `github.com/ohmountain/memcache`.
+- Submit changes from the fork to the upstream repository through a pull request.
 - Document the independently reviewed Minor limitation: payload/closure back-references can prevent fallback finalization, so explicit Close remains required.

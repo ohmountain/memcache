@@ -4,7 +4,7 @@ A bounded, concurrent, in-process LRU cache with optional TTLs. Requires Go 1.18
 or newer and has no external runtime dependencies.
 
 ```sh
-go get github.com/infinitete/memcache@v0.1.0
+go get github.com/ohmountain/memcache
 ```
 
 ```go
@@ -12,7 +12,7 @@ package main
 
 import (
     "fmt"
-    "github.com/infinitete/memcache"
+    "github.com/ohmountain/memcache"
 )
 
 func main() {
@@ -72,10 +72,6 @@ Close waits for it to stop. Capacity does not bound the size of user payloads or
 the number of cache instances created by an application.
 
 ## Compatibility notes
-
-This fork is published as `github.com/infinitete/memcache`. Consumers migrating
-from `github.com/ohmountain/memcache` must update their module dependency and
-imports to obtain this release.
 
 The named cache methods remain available. The formerly exposed embedded
 `sync.RWMutex` has been removed; external `Lock`/`Unlock` calls must be removed.

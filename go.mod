@@ -1,3 +1,3 @@
-module github.com/infinitete/memcache
+module github.com/ohmountain/memcache
 
 go 1.18

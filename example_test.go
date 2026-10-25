@@ -3,7 +3,7 @@ package memcache_test
 import (
 	"fmt"
 
-	"github.com/infinitete/memcache"
+	"github.com/ohmountain/memcache"
 )
 
 func Example() {
