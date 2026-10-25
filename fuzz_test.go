@@ -26,36 +26,17 @@ func FuzzCacheModel(f *testing.F) {
 		}
 		capacity := uint(rawCapacity % 8)
 		ttl := rawCapacity&8 == 0
-		clock := &testClock{now: modelEpoch}
-		m := newMemcache[int](capacity, ttl, clock.Now, false)
-		defer m.Close()
-		model := newCacheModel(int(capacity), ttl, modelEpoch)
+		m, clock, model := newModelSequenceFixture(t, capacity, ttl)
 		keys := []string{"", "a", "b", "c", "中文", "\x00", "another-key", "last"}
 		for i := 0; i+2 < len(operations); i += 3 {
 			key := keys[int(operations[i+1])%len(keys)]
 			value := int(operations[i+2])
-			var op modelOp
-			switch operations[i] % 10 {
-			case 0:
-				op = modelOp{Kind: 0, Key: key, Value: value}
+			op := modelOp{Kind: operations[i] % 10, Key: key, Value: value}
+			switch op.Kind {
 			case 1:
-				op = modelOp{Kind: 1, Key: key, Value: value, TTL: int64(operations[i+2]%8) - 1}
-			case 2:
-				op = modelOp{Kind: 2, Key: key}
-			case 3:
-				op = modelOp{Kind: 3, Key: key}
-			case 4:
-				op = modelOp{Kind: 4}
+				op.TTL = int64(operations[i+2]%8) - 1
 			case 5:
-				op = modelOp{Kind: 5, Advance: time.Duration(int64(operations[i+2]%5)+1) * time.Second}
-			case 6:
-				op = modelOp{Kind: 6}
-			case 7:
-				op = modelOp{Kind: 7, Key: key}
-			case 8:
-				op = modelOp{Kind: 8}
-			case 9:
-				op = modelOp{Kind: 9}
+				op.Advance = time.Duration(int64(operations[i+2]%5)+1) * time.Second
 			}
 			stepModelOp(t, i/3, m, clock, model, op)
 		}

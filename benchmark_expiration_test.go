@@ -39,40 +39,54 @@ func BenchmarkCacheExpiry(b *testing.B) {
 	if *cachePerfFull {
 		capacities = append(capacities, 1000000)
 	}
+	// Each target pairs its measured operation with the post-op state it
+	// must leave behind.
+	targets := []struct {
+		name   string
+		run    func(m *Memcache[int])
+		verify func(b *testing.B, snap cacheSnapshot, capacity int)
+	}{
+		{
+			name: "FirstSet",
+			run:  func(m *Memcache[int]) { m.Set("new", 1) },
+			verify: func(b *testing.B, snap cacheSnapshot, capacity int) {
+				if len(snap.Items) != 1 || snap.Items["new"].Value != 1 {
+					b.Fatalf("after first Set over expired entries: %d items", len(snap.Items))
+				}
+			},
+		},
+		{
+			name: "FirstLookup",
+			run:  func(m *Memcache[int]) { m.Lookup("0") },
+			verify: func(b *testing.B, snap cacheSnapshot, capacity int) {
+				if len(snap.Items) != capacity-1 {
+					b.Fatalf("lookup must remove only its target: %d of %d remain", len(snap.Items), capacity)
+				}
+			},
+		},
+		{
+			name: "Size",
+			run:  func(m *Memcache[int]) { m.Size() },
+			verify: func(b *testing.B, snap cacheSnapshot, capacity int) {
+				if len(snap.Items) != 0 {
+					b.Fatalf("Size must purge every expired entry: %d remain", len(snap.Items))
+				}
+			},
+		},
+	}
 	for _, capacity := range capacities {
-		for _, target := range []string{"FirstSet", "FirstLookup", "Size"} {
+		for _, target := range targets {
 			capacity, target := capacity, target
-			b.Run(fmt.Sprintf("%s-cap%d", target, capacity), func(b *testing.B) {
+			b.Run(fmt.Sprintf("%s-cap%d", target.name, capacity), func(b *testing.B) {
 				if b.N != 1 {
 					b.Skipf("requires exactly one iteration, got N=%d; use -benchtime=1x", b.N)
 				}
 				m, clock := prepareExpiryBenchmark(b, capacity)
 				clock.Advance(time.Second)
 				b.ResetTimer()
-				switch target {
-				case "FirstSet":
-					m.Set("new", 1)
-				case "FirstLookup":
-					m.Lookup("0")
-				case "Size":
-					m.Size()
-				}
+				target.run(m)
 				b.StopTimer()
-				snap := snapshotCache(m)
-				switch target {
-				case "FirstSet":
-					if len(snap.Items) != 1 || snap.Items["new"].Value != 1 {
-						b.Fatalf("after first Set over expired entries: %d items", len(snap.Items))
-					}
-				case "FirstLookup":
-					if len(snap.Items) != capacity-1 {
-						b.Fatalf("lookup must remove only its target: %d of %d remain", len(snap.Items), capacity)
-					}
-				case "Size":
-					if len(snap.Items) != 0 {
-						b.Fatalf("Size must purge every expired entry: %d remain", len(snap.Items))
-					}
-				}
+				target.verify(b, snapshotCache(m), capacity)
 				assertInvariants(b, m)
 			})
 		}

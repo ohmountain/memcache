@@ -50,7 +50,8 @@ them before trusting it:
 The fixed `resources` keys are case-dependent: `reclaim_duration_ns` means
 expired-entry reclamation time in the expiry scenarios but total Close time
 in `lifecycle`; `owned_workers` is recorded when the run owns cache
-instances with a meaningful worker count (idle and lifecycle); always
+instances with a meaningful worker count (steady, idle, and lifecycle —
+steady reports 0 because its TTL-less cache starts no cleaner); always
 disambiguate via the `case` field. Non-applicable keys are omitted — a
 missing key never means zero.
 
@@ -81,8 +82,9 @@ missing key never means zero.
   repeated benchmark files; install it into a scratch GOBIN:
 
 ```sh
-GOBIN="$(mktemp -d)" go install golang.org/x/perf/cmd/benchstat@latest
-"$(that-dir)/benchstat" old.log new.log
+bin="$(mktemp -d)"
+GOBIN="$bin" go install golang.org/x/perf/cmd/benchstat@latest
+"$bin/benchstat" old.log new.log
 ```
 
 Measurement stability is checked by splitting one 10-repetition file into

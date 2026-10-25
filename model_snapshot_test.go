@@ -65,7 +65,7 @@ func liveSnapshot(s cacheSnapshot, now time.Time) (map[string]int, []string) {
 }
 
 func snapshotEpochClock() *testClock {
-	return &testClock{now: time.Date(2026, 10, 25, 0, 0, 0, 0, time.UTC)}
+	return &testClock{now: modelEpoch}
 }
 
 func TestSnapshotPreservesExpiredPhysicalEntries(t *testing.T) {
@@ -125,16 +125,14 @@ func TestSnapshotDoesNotAliasState(t *testing.T) {
 
 // validateSnapshot checks a frozen copy is internally consistent. It may run
 // on a snapshotter goroutine, so it reports with t.Errorf instead of t.Fatal.
-func validateSnapshot(t *testing.T, s cacheSnapshot, capacity uint) bool {
+func validateSnapshot(t *testing.T, s cacheSnapshot) {
 	t.Helper()
-	if uint(len(s.Items)) > capacity {
-		t.Errorf("snapshot holds %d items over capacity %d", len(s.Items), capacity)
-		return false
+	if uint(len(s.Items)) > s.Capacity {
+		t.Errorf("snapshot holds %d items over capacity %d", len(s.Items), s.Capacity)
+		return
 	}
-	ok := true
 	fail := func(format string, args ...interface{}) {
 		t.Errorf(format, args...)
-		ok = false
 	}
 	seen := make(map[string]bool, len(s.Order))
 	for i, key := range s.Order {
@@ -169,7 +167,6 @@ func validateSnapshot(t *testing.T, s cacheSnapshot, capacity uint) bool {
 	if heapMembers != len(s.Heap) {
 		fail("heap view has %d entries but %d items claim membership", len(s.Heap), heapMembers)
 	}
-	return ok
 }
 
 func TestSnapshotConcurrentMutation(t *testing.T) {
@@ -194,11 +191,11 @@ func TestSnapshotConcurrentMutation(t *testing.T) {
 		defer wg.Done()
 		<-start
 		for i := 0; i < 2000; i++ {
-			validateSnapshot(t, snapshotCache(m), capacity)
+			validateSnapshot(t, snapshotCache(m))
 		}
 	}()
 	close(start)
 	wg.Wait()
-	validateSnapshot(t, snapshotCache(m), capacity)
+	validateSnapshot(t, snapshotCache(m))
 	assertInvariants(t, m)
 }

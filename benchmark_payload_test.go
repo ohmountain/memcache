@@ -1,7 +1,6 @@
 package memcache
 
 import (
-	"strconv"
 	"testing"
 )
 
@@ -12,7 +11,7 @@ import (
 // happens in the preparation phase and never enters the timed loop.
 func BenchmarkCachePayload(b *testing.B) {
 	b.Run("int", func(b *testing.B) {
-		keys := payloadKeys()
+		keys := numericKeys(1024)
 		values := make([]int, len(keys))
 		for i := range values {
 			values[i] = i
@@ -20,7 +19,7 @@ func BenchmarkCachePayload(b *testing.B) {
 		benchmarkPayloadOps(b, keys, values, "scalar int")
 	})
 	b.Run("bytes256", func(b *testing.B) {
-		keys := payloadKeys()
+		keys := numericKeys(1024)
 		values := make([][256]byte, len(keys))
 		for i := range values {
 			values[i] = [256]byte{byte(i)}
@@ -28,7 +27,7 @@ func BenchmarkCachePayload(b *testing.B) {
 		benchmarkPayloadOps(b, keys, values, "256-byte array copied by value")
 	})
 	b.Run("bytes4k", func(b *testing.B) {
-		keys := payloadKeys()
+		keys := numericKeys(1024)
 		payload := make([]byte, 4096)
 		values := make([][]byte, len(keys))
 		for i := range values {
@@ -36,14 +35,6 @@ func BenchmarkCachePayload(b *testing.B) {
 		}
 		benchmarkPayloadOps(b, keys, values, "one pre-allocated 4096-byte slice shared by all keys")
 	})
-}
-
-func payloadKeys() []string {
-	keys := make([]string, 1024)
-	for i := range keys {
-		keys[i] = strconv.Itoa(i)
-	}
-	return keys
 }
 
 func benchmarkPayloadOps[T CacheAble](b *testing.B, keys []string, values []T, holding string) {
@@ -57,9 +48,14 @@ func benchmarkPayloadOps[T CacheAble](b *testing.B, keys []string, values []T, h
 		b.ReportAllocs()
 		b.ResetTimer()
 		hits := 0
+		keyIndex := 0
 		for i := 0; i < b.N; i++ {
-			if _, ok := m.Lookup(keys[i%len(keys)]); ok {
+			if _, ok := m.Lookup(keys[keyIndex]); ok {
 				hits++
+			}
+			keyIndex++
+			if keyIndex == len(keys) {
+				keyIndex = 0
 			}
 		}
 		b.StopTimer()
@@ -70,8 +66,17 @@ func benchmarkPayloadOps[T CacheAble](b *testing.B, keys []string, values []T, h
 	b.Run("Set", func(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
+		keyIndex, valueIndex := 0, 0
 		for i := 0; i < b.N; i++ {
-			m.Set(keys[i%len(keys)], values[i%len(values)])
+			m.Set(keys[keyIndex], values[valueIndex])
+			keyIndex++
+			if keyIndex == len(keys) {
+				keyIndex = 0
+			}
+			valueIndex++
+			if valueIndex == len(values) {
+				valueIndex = 0
+			}
 		}
 		b.StopTimer()
 	})

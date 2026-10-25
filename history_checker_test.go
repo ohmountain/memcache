@@ -69,7 +69,7 @@ func checkHistory(initial *cacheModel, events []historyEvent, final *cacheSnapsh
 			}
 		}
 	}
-	allChosen := uint16(1)<<uint(n) - 1
+	allChosen := (uint16(1) << uint(n)) - 1
 	states := 0
 	budgetExhausted := false
 	witness := make([]int, 0, n)
@@ -131,8 +131,8 @@ func setThenReadEvents(readResult modelResult) []historyEvent {
 
 func TestHistoryRejectsImpossibleRead(t *testing.T) {
 	events := setThenReadEvents(modelResult{Value: 2, Present: true})
-	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, 100000)
-	if v != historyVerdict("invalid") || len(witness) != 0 {
+	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, historyDefaultBudget)
+	if v != historyInvalid || len(witness) != 0 {
 		t.Fatal("accepted impossible history")
 	}
 }
@@ -141,8 +141,8 @@ func TestHistoryRespectsRealTime(t *testing.T) {
 	// The Set returned before the Lookup was invoked, so every serialization
 	// must see the write: a reported miss is impossible.
 	events := setThenReadEvents(modelResult{})
-	v, _ := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, 100000)
-	if v != historyVerdict("invalid") {
+	v, _ := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, historyDefaultBudget)
+	if v != historyInvalid {
 		t.Fatalf("verdict = %q, want invalid", v)
 	}
 }
@@ -155,12 +155,12 @@ func TestHistoryBudgetExhausted(t *testing.T) {
 		{ID: 2, Call: 7, Return: 8, Op: modelOp{Kind: 2, Key: "k"}, Result: modelResult{Value: 2, Present: true}},
 	}
 	v, _ := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, 1)
-	if v != historyVerdict("inconclusive") {
+	if v != historyInconclusive {
 		t.Fatalf("verdict = %q, want inconclusive", v)
 	}
 	// The same history must decide with a real budget.
-	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, 100000)
-	if v != historyVerdict("valid") || len(witness) != 3 {
+	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, historyDefaultBudget)
+	if v != historyValid || len(witness) != 3 {
 		t.Fatalf("verdict = %q witness = %v, want valid full witness", v, witness)
 	}
 }
@@ -173,8 +173,8 @@ func TestHistoryAcceptsOverlappingWrites(t *testing.T) {
 		{ID: 1, Call: 2, Return: 5, Op: modelOp{Kind: 0, Key: "k", Value: 2}},
 		{ID: 2, Call: 7, Return: 8, Op: modelOp{Kind: 2, Key: "k"}, Result: modelResult{Value: 2, Present: true}},
 	}
-	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, 100000)
-	if v != historyVerdict("valid") {
+	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), events, nil, historyDefaultBudget)
+	if v != historyValid {
 		t.Fatalf("verdict = %q, want valid", v)
 	}
 	// The witness must replay on a fresh model and reproduce every result.
@@ -184,16 +184,8 @@ func TestHistoryAcceptsOverlappingWrites(t *testing.T) {
 	}
 	model := newCacheModel(2, false, modelEpoch)
 	for _, id := range witness {
-		got := model.apply(byID[id].Op)
-		switch byID[id].Op.Kind {
-		case 2, 7:
-			if got.Present != byID[id].Result.Present || (byID[id].Result.Present && got.Value != byID[id].Result.Value) {
-				t.Fatalf("witness replay of %d: got %+v, want %+v", id, got, byID[id].Result)
-			}
-		case 8:
-			if got.Size != byID[id].Result.Size {
-				t.Fatalf("witness replay of %d: Size %d, want %d", id, got.Size, byID[id].Result.Size)
-			}
+		if got := model.apply(byID[id].Op); !historyResultMatches(byID[id], got) {
+			t.Fatalf("witness replay of %d: got %+v, want %+v", id, got, byID[id].Result)
 		}
 	}
 }
@@ -211,23 +203,23 @@ func TestHistoryRejectsMalformedEvents(t *testing.T) {
 		{"duplicate ids", []historyEvent{
 			{ID: 0, Call: 1, Return: 2, Op: modelOp{Kind: 0, Key: "k", Value: 1}},
 			{ID: 0, Call: 3, Return: 4, Op: modelOp{Kind: 2, Key: "k"}, Result: modelResult{Value: 1, Present: true}},
-		}, 100000},
+		}, historyDefaultBudget},
 		{"call not before return", []historyEvent{
 			{ID: 0, Call: 5, Return: 5, Op: modelOp{Kind: 0, Key: "k", Value: 1}},
-		}, 100000},
-		{"empty history", nil, 100000},
+		}, historyDefaultBudget},
+		{"empty history", nil, historyDefaultBudget},
 		{"nonpositive budget", base, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			v, witness := checkHistory(newCacheModel(2, false, modelEpoch), tc.events, nil, tc.budget)
-			if v != historyVerdict("inconclusive") || witness != nil {
+			if v != historyInconclusive || witness != nil {
 				t.Fatalf("verdict = %q witness = %v, want inconclusive", v, witness)
 			}
 		})
 	}
 	// A nil initial model is malformed input, never a panic.
-	if v, witness := checkHistory(nil, base, nil, 100000); v != historyVerdict("inconclusive") || witness != nil {
+	if v, witness := checkHistory(nil, base, nil, historyDefaultBudget); v != historyInconclusive || witness != nil {
 		t.Fatalf("nil model: verdict = %q witness = %v, want inconclusive", v, witness)
 	}
 	// More than eight operations are refused outright.
@@ -235,7 +227,7 @@ func TestHistoryRejectsMalformedEvents(t *testing.T) {
 	for i := 0; i < 9; i++ {
 		tooMany = append(tooMany, historyEvent{ID: i, Call: uint64(2*i + 1), Return: uint64(2*i + 2), Op: modelOp{Kind: 3, Key: "k"}})
 	}
-	if v, _ := checkHistory(newCacheModel(2, false, modelEpoch), tooMany, nil, 100000); v != historyVerdict("inconclusive") {
+	if v, _ := checkHistory(newCacheModel(2, false, modelEpoch), tooMany, nil, historyDefaultBudget); v != historyInconclusive {
 		t.Fatalf("verdict = %q, want inconclusive for oversized history", v)
 	}
 }
@@ -246,13 +238,13 @@ func TestHistoryMatchesFinalState(t *testing.T) {
 		{ID: 1, Call: 2, Return: 5, Op: modelOp{Kind: 0, Key: "k", Value: 2}},
 	}
 	withTwo := &cacheSnapshot{Capacity: 2, Items: map[string]snapshotItem{"k": {Value: 2}}, Order: []string{"k"}}
-	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), overlapping, withTwo, 100000)
-	if v != historyVerdict("valid") || len(witness) != 2 {
+	v, witness := checkHistory(newCacheModel(2, false, modelEpoch), overlapping, withTwo, historyDefaultBudget)
+	if v != historyValid || len(witness) != 2 {
 		t.Fatalf("verdict = %q witness = %v, want valid witness", v, witness)
 	}
 	withThree := &cacheSnapshot{Capacity: 2, Items: map[string]snapshotItem{"k": {Value: 3}}, Order: []string{"k"}}
-	v, witness = checkHistory(newCacheModel(2, false, modelEpoch), overlapping, withThree, 100000)
-	if v != historyVerdict("invalid") || len(witness) != 0 {
+	v, witness = checkHistory(newCacheModel(2, false, modelEpoch), overlapping, withThree, historyDefaultBudget)
+	if v != historyInvalid || len(witness) != 0 {
 		t.Fatalf("verdict = %q witness = %v, want invalid", v, witness)
 	}
 }

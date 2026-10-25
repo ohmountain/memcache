@@ -51,14 +51,23 @@ func TestPerformanceRoundsReleaseOwnedCaches(t *testing.T) {
 	}
 }
 
+// cleanerRunning reports whether a cache's background cleaner has not
+// stopped yet. It is the one place that reads the stopped channel.
+func cleanerRunning[T CacheAble](m *Memcache[T]) bool {
+	select {
+	case <-m.state.stopped:
+		return false
+	default:
+		return true
+	}
+}
+
 // checkCachesReleased verifies every cache's cleaner stopped and the global
 // registry returned to its pre-round count. It returns an error instead of
 // failing so tests can also assert that leaks are caught.
 func checkCachesReleased[T CacheAble](caches []*Memcache[T], livesBefore int) error {
 	for i, m := range caches {
-		select {
-		case <-m.state.stopped:
-		default:
+		if cleanerRunning(m) {
 			return fmt.Errorf("cache %d cleaner still running", i)
 		}
 	}
@@ -72,9 +81,7 @@ func checkCachesReleased[T CacheAble](caches []*Memcache[T], livesBefore int) er
 func ownedWorkersRunning[T CacheAble](caches []*Memcache[T]) uint64 {
 	var running uint64
 	for _, m := range caches {
-		select {
-		case <-m.state.stopped:
-		default:
+		if cleanerRunning(m) {
 			running++
 		}
 	}
@@ -225,6 +232,7 @@ func runLifecycleScenario(t *testing.T, base perfRecord) perfRecord {
 	if Lives() != before {
 		t.Fatalf("lifecycle rounds leaked registrations: before=%d after=%d", before, Lives())
 	}
+	// int variant: resources were not set above; measure after the rounds.
 	if base.Resources == nil {
 		alloc, objects := readHeapStats()
 		base.Resources = map[string]uint64{

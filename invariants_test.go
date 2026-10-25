@@ -13,7 +13,7 @@ func assertInvariants(t testing.TB, m *Memcache[int]) {
 	if len(s.holder) != s.order.Len() || uint(len(s.holder)) > s.capacity {
 		t.Fatalf("inconsistent size: map=%d list=%d capacity=%d", len(s.holder), s.order.Len(), s.capacity)
 	}
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, len(s.holder))
 	for e := s.order.Front(); e != nil; e = e.Next() {
 		n := e.Value.(*node[int])
 		if seen[n.key] || s.holder[n.key] != n || n.element != e {

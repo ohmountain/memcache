@@ -87,13 +87,21 @@ func (m *cacheModel) touch(key string) {
 }
 
 // purgeExpired drops entries whose deadline passed at the model's now,
-// mirroring purgeExpiredLocked.
+// mirroring purgeExpiredLocked: one map pass removes expired items, one
+// filter pass compacts the order slice.
 func (m *cacheModel) purgeExpired() {
 	for key, entry := range m.items {
 		if !entry.deadline.IsZero() && !entry.deadline.After(m.now) {
-			m.removeKey(key)
+			delete(m.items, key)
 		}
 	}
+	kept := m.order[:0]
+	for _, key := range m.order {
+		if _, ok := m.items[key]; ok {
+			kept = append(kept, key)
+		}
+	}
+	m.order = kept
 }
 
 // view returns live values and live LRU order at the given now, without
@@ -143,7 +151,11 @@ func (m *cacheModel) set(key string, value int, ttl int64, expiring bool) {
 		m.removeKey(m.order[len(m.order)-1])
 	}
 	m.items[key] = modelEntry{value: value, deadline: deadline}
-	m.order = append([]string{key}, m.order...)
+	// Prepend in place (memmove semantics) instead of allocating a fresh
+	// slice per insert.
+	m.order = append(m.order, "")
+	copy(m.order[1:], m.order)
+	m.order[0] = key
 }
 
 // apply advances the model by one operation and returns its observable
@@ -215,37 +227,26 @@ func sameStringSlices(a, b []string) bool {
 
 // stepModelOp runs one operation against both the real cache and the model,
 // compares the observable result and the Task 1 live view, and returns the
-// result together with the post-operation physical snapshot.
+// result together with the post-operation physical snapshot. Cache dispatch
+// is shared with recordHistory via executeRecordedOp; only the Advance clock
+// move and the Get pointer-aliasing probe stay local.
 func stepModelOp(t testing.TB, step int, m *Memcache[int], clock *testClock, model *cacheModel, op modelOp) (modelResult, cacheSnapshot) {
 	t.Helper()
 	want := model.apply(op)
 	var got modelResult
 	switch op.Kind {
-	case 0:
-		m.Set(op.Key, op.Value)
-	case 1:
-		m.SetExpire(op.Key, op.Value, op.TTL)
-	case 2:
-		value, present := m.Lookup(op.Key)
-		got = modelResult{Value: value, Present: present}
-	case 3:
-		m.Delete(op.Key)
-	case 4:
-		m.Clear()
 	case 5:
 		clock.Advance(op.Advance)
-	case 6:
-		m.checkExpired()
 	case 7:
 		pointer := m.Get(op.Key)
 		if pointer != nil {
 			got = modelResult{Value: *pointer, Present: true}
+			// Get returns a pointer to a shallow copy; writing through it
+			// must never reach the cache.
 			*pointer = -1
 		}
-	case 8:
-		got = modelResult{Size: m.Size()}
-	case 9:
-		m.Close()
+	default:
+		got = executeRecordedOp(m, op)
 	}
 	if op.Kind == 2 || op.Kind == 7 {
 		if got.Present != want.Present || (want.Present && got.Value != want.Value) {
@@ -273,14 +274,22 @@ func stepModelOp(t testing.TB, step int, m *Memcache[int], clock *testClock, mod
 	return want, snap
 }
 
+// newModelSequenceFixture builds the frozen-epoch trio used by every
+// sequence interpreter site: a private-clock cache without a cleaner, and a
+// model starting at the same instant.
+func newModelSequenceFixture(tb testing.TB, capacity uint, ttl bool) (*Memcache[int], *testClock, *cacheModel) {
+	tb.Helper()
+	clock := &testClock{now: modelEpoch}
+	m := newMemcache[int](capacity, ttl, clock.Now, false)
+	tb.Cleanup(m.Close)
+	return m, clock, newCacheModel(int(capacity), ttl, modelEpoch)
+}
+
 // runModelSequence executes ops against a fresh cache and model, verifying
 // every step.
 func runModelSequence(t testing.TB, capacity uint, ttl bool, ops []modelOp) {
 	t.Helper()
-	clock := &testClock{now: modelEpoch}
-	m := newMemcache[int](capacity, ttl, clock.Now, false)
-	defer m.Close()
-	model := newCacheModel(int(capacity), ttl, modelEpoch)
+	m, clock, model := newModelSequenceFixture(t, capacity, ttl)
 	for step, op := range ops {
 		stepModelOp(t, step, m, clock, model, op)
 	}
@@ -291,10 +300,7 @@ func runModelSequence(t testing.TB, capacity uint, ttl bool, ops []modelOp) {
 // step. No observation may purge or refresh anything: after Lookup of b the
 // expired physical entry a must still exist.
 func TestModelExpiredSequenceWithoutSize(t *testing.T) {
-	clock := &testClock{now: modelEpoch}
-	m := newMemcache[int](3, true, clock.Now, false)
-	defer m.Close()
-	model := newCacheModel(3, true, modelEpoch)
+	m, clock, model := newModelSequenceFixture(t, 3, true)
 	var last cacheSnapshot
 	for step, op := range []modelOp{
 		{Kind: 1, Key: "a", Value: 1, TTL: 1},
@@ -360,7 +366,9 @@ func TestModelBoundaries(t *testing.T) {
 		capacity uint
 		ttl      bool
 		ops      []modelOp
-		want     map[int]modelResult
+		// want is keyed by index into ops; only observable kinds (2, 7, 8)
+		// carry expectations.
+		want map[int]modelResult
 	}{
 		{
 			name:     "deadline strictly before and exactly at now",
@@ -424,10 +432,7 @@ func TestModelBoundaries(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			clock := &testClock{now: modelEpoch}
-			m := newMemcache[int](tc.capacity, tc.ttl, clock.Now, false)
-			defer m.Close()
-			model := newCacheModel(int(tc.capacity), tc.ttl, modelEpoch)
+			m, clock, model := newModelSequenceFixture(t, tc.capacity, tc.ttl)
 			for step, op := range tc.ops {
 				got, _ := stepModelOp(t, step, m, clock, model, op)
 				want, ok := tc.want[step]
@@ -447,23 +452,29 @@ func TestModelBoundaries(t *testing.T) {
 			}
 		})
 	}
-	// clone independence: mutating the original never reaches the fork.
-	original := newCacheModel(2, true, modelEpoch)
-	original.apply(modelOp{Kind: 0, Key: "a", Value: 1})
-	original.apply(modelOp{Kind: 1, Key: "b", Value: 2, TTL: 5})
-	fork := original.clone()
-	original.apply(modelOp{Kind: 0, Key: "c", Value: 3}) // evicts LRU tail "a"
-	original.apply(modelOp{Kind: 5, Advance: time.Hour})
-	original.apply(modelOp{Kind: 6})
-	forkValues, forkOrder := fork.view(modelEpoch)
-	if !reflect.DeepEqual(forkValues, map[string]int{"a": 1, "b": 2}) || !reflect.DeepEqual(forkOrder, []string{"b", "a"}) {
-		t.Fatalf("clone observed original mutation: values=%v order=%v", forkValues, forkOrder)
-	}
-	liveValues, liveOrder := original.view(modelEpoch.Add(time.Hour))
-	if !reflect.DeepEqual(liveValues, map[string]int{"c": 3}) || !reflect.DeepEqual(liveOrder, []string{"c"}) {
-		t.Fatalf("original after eviction+expiry: values=%v order=%v", liveValues, liveOrder)
-	}
+	t.Run("clone independence", func(t *testing.T) {
+		// Mutating the original never reaches the fork.
+		original := newCacheModel(2, true, modelEpoch)
+		original.apply(modelOp{Kind: 0, Key: "a", Value: 1})
+		original.apply(modelOp{Kind: 1, Key: "b", Value: 2, TTL: 5})
+		fork := original.clone()
+		original.apply(modelOp{Kind: 0, Key: "c", Value: 3}) // evicts LRU tail "a"
+		original.apply(modelOp{Kind: 5, Advance: time.Hour})
+		original.apply(modelOp{Kind: 6})
+		forkValues, forkOrder := fork.view(modelEpoch)
+		if !reflect.DeepEqual(forkValues, map[string]int{"a": 1, "b": 2}) || !reflect.DeepEqual(forkOrder, []string{"b", "a"}) {
+			t.Fatalf("clone observed original mutation: values=%v order=%v", forkValues, forkOrder)
+		}
+		liveValues, liveOrder := original.view(modelEpoch.Add(time.Hour))
+		if !reflect.DeepEqual(liveValues, map[string]int{"c": 3}) || !reflect.DeepEqual(liveOrder, []string{"c"}) {
+			t.Fatalf("original after eviction+expiry: values=%v order=%v", liveValues, liveOrder)
+		}
+	})
 }
+
+// modelLargeSteps bounds TestModelLargeSequences: enough steps to sweep the
+// key space and heap at the largest capacity several times over.
+const modelLargeSteps = 4096
 
 func TestModelLargeSequences(t *testing.T) {
 	const seed = int64(20261025)
@@ -473,33 +484,16 @@ func TestModelLargeSequences(t *testing.T) {
 	}{{64, true}, {64, false}, {1024, true}, {1024, false}} {
 		t.Run(fmt.Sprintf("capacity=%d,ttl=%v", config.capacity, config.ttl), func(t *testing.T) {
 			rng := rand.New(rand.NewSource(seed))
-			ops := make([]modelOp, 0, 4096)
-			for i := 0; i < 4096; i++ {
+			ops := make([]modelOp, 0, modelLargeSteps)
+			for i := 0; i < modelLargeSteps; i++ {
 				key := strconv.Itoa(rng.Intn(2 * int(config.capacity)))
 				op := modelOp{Key: key, Value: rng.Intn(1000)}
-				switch rng.Intn(10) {
-				case 0:
-					op.Kind = 0
+				op.Kind = uint8(rng.Intn(10))
+				switch op.Kind {
 				case 1:
-					op.Kind = 1
 					op.TTL = int64(rng.Intn(8)) - 1
-				case 2:
-					op.Kind = 2
-				case 3:
-					op.Kind = 3
-				case 4:
-					op.Kind = 4
 				case 5:
-					op.Kind = 5
 					op.Advance = time.Duration(rng.Intn(5)+1) * time.Second
-				case 6:
-					op.Kind = 6
-				case 7:
-					op.Kind = 7
-				case 8:
-					op.Kind = 8
-				case 9:
-					op.Kind = 9
 				}
 				ops = append(ops, op)
 			}

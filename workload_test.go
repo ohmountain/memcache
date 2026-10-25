@@ -52,10 +52,6 @@ func makeWorkload(cfg workloadConfig, count int) ([]workloadOp, error) {
 	if seed == 0 {
 		seed = workloadDefaultSeed
 	}
-	keys := make([]string, cfg.KeyCount)
-	for i := range keys {
-		keys[i] = "k" + strconv.Itoa(i)
-	}
 	rng := rand.New(rand.NewSource(seed))
 	var zipf *rand.Zipf
 	if cfg.Distribution == "zipf" {
@@ -75,10 +71,15 @@ func makeWorkload(cfg workloadConfig, count int) ([]workloadOp, error) {
 		if index < 0 || index >= cfg.KeyCount {
 			index = cfg.KeyCount - 1
 		}
-		ops[i] = workloadOp{Key: keys[index], Read: i%100 < cfg.ReadPercent}
+		ops[i] = workloadOp{Key: workloadKey(index), Read: i%100 < cfg.ReadPercent}
 	}
 	return ops, nil
 }
+
+// workloadKey is the single source of the workload key format. Fixture
+// preloads elsewhere must use it too, or hit scenarios silently degrade
+// into miss scenarios.
+func workloadKey(i int) string { return "k" + strconv.Itoa(i) }
 
 func TestWorkloadDeterministic(t *testing.T) {
 	cfg := workloadConfig{Capacity: 1024, KeyCount: 2048, ReadPercent: 95, Distribution: "uniform", Seed: 20261025}
@@ -87,7 +88,10 @@ func TestWorkloadDeterministic(t *testing.T) {
 		t.Fatal(err)
 	}
 	second, err := makeWorkload(cfg, 100)
-	if err != nil || !reflect.DeepEqual(first, second) {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(first, second) {
 		t.Fatal("unstable workload")
 	}
 	for _, tc := range []struct {
@@ -148,18 +152,20 @@ func TestWorkloadDeterministic(t *testing.T) {
 func TestWorkloadRejectsInvalidConfig(t *testing.T) {
 	valid := workloadConfig{Capacity: 16, KeyCount: 32, ReadPercent: 50, Distribution: "uniform", Seed: 1}
 	cases := []struct {
-		name string
-		cfg  workloadConfig
+		name   string
+		mutate func(*workloadConfig)
 	}{
-		{"negative capacity", func(c workloadConfig) workloadConfig { c.Capacity = -1; return c }(valid)},
-		{"zero key count", func(c workloadConfig) workloadConfig { c.KeyCount = 0; return c }(valid)},
-		{"negative key count", func(c workloadConfig) workloadConfig { c.KeyCount = -5; return c }(valid)},
-		{"unknown distribution", func(c workloadConfig) workloadConfig { c.Distribution = "hot"; return c }(valid)},
-		{"read percent too low", func(c workloadConfig) workloadConfig { c.ReadPercent = -1; return c }(valid)},
-		{"read percent too high", func(c workloadConfig) workloadConfig { c.ReadPercent = 101; return c }(valid)},
+		{"negative capacity", func(c *workloadConfig) { c.Capacity = -1 }},
+		{"zero key count", func(c *workloadConfig) { c.KeyCount = 0 }},
+		{"negative key count", func(c *workloadConfig) { c.KeyCount = -5 }},
+		{"unknown distribution", func(c *workloadConfig) { c.Distribution = "hot" }},
+		{"read percent too low", func(c *workloadConfig) { c.ReadPercent = -1 }},
+		{"read percent too high", func(c *workloadConfig) { c.ReadPercent = 101 }},
 	}
 	for _, invalid := range cases {
-		if _, err := makeWorkload(invalid.cfg, 10); err == nil {
+		cfg := valid
+		invalid.mutate(&cfg)
+		if _, err := makeWorkload(cfg, 10); err == nil {
 			t.Fatalf("%s: expected error", invalid.name)
 		}
 	}

@@ -298,6 +298,19 @@ func newRealLoadClock() *realLoadClock {
 	return &realLoadClock{timer: timer}
 }
 
+// stopDrainedTimer stops the timer and, per the Go 1.18 timer rules, drains
+// an event that already fired so the channel is clean before the next use.
+// This clock's single-owner scheduler is the only receiver, so a
+// non-blocking drain cannot steal an event anyone else is waiting on.
+func stopDrainedTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+}
+
 func (c *realLoadClock) Now() time.Time { return time.Now() }
 
 // WaitUntil must be called from one goroutine at a time (the scheduler).
@@ -309,23 +322,13 @@ func (c *realLoadClock) WaitUntil(ctx context.Context, target time.Time) error {
 		return errRealLoadClockClosed
 	}
 	if d := time.Until(target); d > 0 {
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
+		stopDrainedTimer(timer)
 		timer.Reset(d)
 		select {
 		case <-timer.C:
 			return nil
 		case <-ctx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
+			stopDrainedTimer(timer)
 			return ctx.Err()
 		}
 	}
@@ -336,12 +339,7 @@ func (c *realLoadClock) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.timer != nil {
-		if !c.timer.Stop() {
-			select {
-			case <-c.timer.C:
-			default:
-			}
-		}
+		stopDrainedTimer(c.timer)
 		c.timer = nil
 	}
 }
@@ -601,7 +599,7 @@ func TestOpenLoopSeparatesSetLatency(t *testing.T) {
 	if first := <-entered; first != 0 {
 		t.Fatalf("first entered id = %d", first)
 	}
-	// Planned 0,1,2,3ms; completions at 1,3,10,13ms: lookups 1ms/2ms, sets 8ms/10ms.
+	// Planned 0,1,2,3ms; completions at 1,3,10,13ms: lookups 1ms/8ms, sets 2ms/10ms.
 	clock.AdvanceTo(base.Add(time.Millisecond))
 	close(gates[0])
 	if second := <-entered; second != 1 {

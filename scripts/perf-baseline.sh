@@ -182,5 +182,5 @@ command -v sha256sum >/dev/null 2>&1 || hash_tool="shasum -a 256"
   cd "$out"
   find . -type f ! -name SHA256SUMS ! -name manifest.txt -print0 | sort -z | xargs -0 $hash_tool >SHA256SUMS
 )
-record "files_hashed=$(find "$out" -type f ! -name SHA256SUMS | wc -l | tr -d ' ')"
+record "files_hashed=$(find "$out" -type f ! -name SHA256SUMS ! -name manifest.txt | wc -l | tr -d ' ')"
 echo "done: $out"

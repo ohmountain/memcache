@@ -17,8 +17,8 @@ race detector, coverage instrumentation, built-in fuzzing, and benchmarks.
 | `fuzz_test.go` | Byte-encoded operations replayed against the model; observation uses snapshots only, so watching the cache never purges or refreshes |
 | `history_checker_test.go` | Bounded serial-order search honoring real time; impossible reads, budget exhaustion, malformed events, final-state matching |
 | `history_integration_test.go` | Recorded concurrent histories on a real cache replayed through the checker; renewal racing checkExpired |
-| `workload_test.go` | Deterministic read/write mixes (positional ratios), distribution validation, expiry fixture with one deadline |
-| `benchmark_*_test.go` | Named micro benchmarks: workloads, payloads, first post-expiry operation with `-benchtime=1x` |
+| `workload_test.go` | Deterministic read/write mixes (positional ratios), distribution validation, default-seed behavior |
+| `benchmark_*_test.go` | Named micro benchmarks: workloads, payloads, first post-expiry operation with `-benchtime=1x`, and the one-deadline expiry fixture test |
 | `performance_load_test.go` | Open-loop generator: nearest-rank quantiles, overload drop accounting, scheduler lag, cancellation join, Set-only latency |
 | `performance*_test.go` | Scenario evidence: JSON schema with O_EXCL writes, real expiry fixtures, instance/lifecycle resource rounds |
 | `example_test.go` | Executable public-package examples |

@@ -37,7 +37,11 @@ func recordHistory(m *Memcache[int], programs [][]modelOp) []historyEvent {
 	}
 	close(start)
 	wg.Wait()
-	merged := make([]historyEvent, 0, 16)
+	total := 0
+	for _, events := range recorded {
+		total += len(events)
+	}
+	merged := make([]historyEvent, 0, total)
 	for _, events := range recorded {
 		merged = append(merged, events...)
 	}
@@ -75,6 +79,21 @@ func executeRecordedOp(m *Memcache[int], op modelOp) modelResult {
 	return modelResult{}
 }
 
+// requireValidHistory records concurrent worker programs on m, checks the
+// history against a fresh model with the post-join snapshot as the final
+// state, and requires a valid verdict — anything else fails with the full
+// history printed.
+func requireValidHistory(t *testing.T, m *Memcache[int], capacity uint, ttl bool, programs [][]modelOp) {
+	t.Helper()
+	events := recordHistory(m, programs)
+	final := snapshotCache(m)
+	verdict, _ := checkHistory(newCacheModel(int(capacity), ttl, modelEpoch), events, &final, historyDefaultBudget)
+	if verdict != historyValid {
+		t.Fatalf("verdict %q, history: %+v", verdict, events)
+	}
+	assertInvariants(t, m)
+}
+
 // TestHistoryRecordedConcurrentOperations records real concurrent histories
 // on a fresh cache per seed and requires the checker to find a valid
 // serialization for every one. Inconclusive is a failure: it prints the full
@@ -88,9 +107,7 @@ func TestHistoryRecordedConcurrentOperations(t *testing.T) {
 			total := 4 + rng.Intn(5)
 			keys := []string{"a", "b", "c"}[:2+rng.Intn(2)]
 			ttl := seed%2 == 0
-			clock := &testClock{now: modelEpoch}
-			m := newMemcache[int](2, ttl, clock.Now, false)
-			defer m.Close()
+			m, _, _ := newModelSequenceFixture(t, 2, ttl)
 			programs := make([][]modelOp, workers)
 			for i := 0; i < total; i++ {
 				key := keys[rng.Intn(len(keys))]
@@ -111,14 +128,7 @@ func TestHistoryRecordedConcurrentOperations(t *testing.T) {
 				}
 				programs[i%workers] = append(programs[i%workers], op)
 			}
-			events := recordHistory(m, programs)
-			final := snapshotCache(m)
-			model := newCacheModel(2, ttl, modelEpoch)
-			verdict, _ := checkHistory(model, events, &final, 100000)
-			if verdict != historyVerdict("valid") {
-				t.Fatalf("seed %d verdict %q, history: %+v", seed, verdict, events)
-			}
-			assertInvariants(t, m)
+			requireValidHistory(t, m, 2, ttl, programs)
 		})
 	}
 }
@@ -153,17 +163,8 @@ func TestHistoryScenarios(t *testing.T) {
 	for _, scenario := range scenarios {
 		scenario := scenario
 		t.Run(scenario.name, func(t *testing.T) {
-			clock := &testClock{now: modelEpoch}
-			m := newMemcache[int](scenario.capacity, scenario.ttl, clock.Now, false)
-			defer m.Close()
-			events := recordHistory(m, scenario.programs)
-			final := snapshotCache(m)
-			model := newCacheModel(int(scenario.capacity), scenario.ttl, modelEpoch)
-			verdict, _ := checkHistory(model, events, &final, 100000)
-			if verdict != historyVerdict("valid") {
-				t.Fatalf("verdict %q, history: %+v", verdict, events)
-			}
-			assertInvariants(t, m)
+			m, _, _ := newModelSequenceFixture(t, scenario.capacity, scenario.ttl)
+			requireValidHistory(t, m, scenario.capacity, scenario.ttl, scenario.programs)
 		})
 	}
 }
@@ -172,9 +173,7 @@ func TestHistoryScenarios(t *testing.T) {
 // frozen clock, then advances past the original deadline: the renewed value
 // must survive. Workers never call t.Fatal.
 func TestHistoryRenewalAndCleanup(t *testing.T) {
-	clock := &testClock{now: modelEpoch}
-	m := newMemcache[int](1, true, clock.Now, false)
-	defer m.Close()
+	m, clock, _ := newModelSequenceFixture(t, 1, true)
 	m.SetExpire("k", 1, 1)
 	events := recordHistory(m, [][]modelOp{
 		{{Kind: 1, Key: "k", Value: 2, TTL: 3600}},
@@ -183,7 +182,7 @@ func TestHistoryRenewalAndCleanup(t *testing.T) {
 	final := snapshotCache(m)
 	model := newCacheModel(1, true, modelEpoch)
 	model.apply(modelOp{Kind: 1, Key: "k", Value: 1, TTL: 1})
-	if verdict, _ := checkHistory(model, events, &final, 100000); verdict != historyVerdict("valid") {
+	if verdict, _ := checkHistory(model, events, &final, historyDefaultBudget); verdict != historyValid {
 		t.Fatalf("verdict %q, history: %+v", verdict, events)
 	}
 	clock.Advance(time.Second) // past the original deadline

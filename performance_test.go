@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"container/heap"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,17 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"container/heap"
 )
 
 func TestPerformanceJSONSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "result.json")
-	record := perfRecord{Schema: 1, Case: "noop", GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, GOMAXPROCS: runtime.GOMAXPROCS(0), Seed: 20261025,
+	record := perfRecord{Schema: 1, Case: "noop", GoVersion: runtime.Version(), GOOS: runtime.GOOS, GOARCH: runtime.GOARCH, GOMAXPROCS: runtime.GOMAXPROCS(0), Seed: workloadDefaultSeed,
 		Config:    loadConfig{Rate: 1000, Duration: time.Second, Workers: 1, Queue: 1, BurstWindow: 250 * time.Millisecond},
 		Load:      loadResult{Planned: 1000, Attempted: 1000, Completed: 1000, All: loadQuantiles{Samples: 1000, P50: time.Millisecond}},
 		Resources: map[string]uint64{"goroutines": 4}}
@@ -38,7 +36,7 @@ func TestPerformanceJSONSchema(t *testing.T) {
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded["schema"] != float64(1) || decoded["case"] != "noop" || decoded["seed"] != float64(20261025) {
+	if decoded["schema"] != float64(1) || decoded["case"] != "noop" || decoded["seed"] != float64(workloadDefaultSeed) {
 		t.Fatalf("header fields = %v", decoded)
 	}
 	config, ok := decoded["config"].(map[string]interface{})
@@ -62,7 +60,11 @@ func TestPerformanceJSONSchema(t *testing.T) {
 	if !ok || all["samples"] != float64(1000) || all["p50"] != float64(time.Millisecond) {
 		t.Fatalf("quantiles = %v", all)
 	}
-	if decoded["resources"].(map[string]interface{})["goroutines"] != float64(4) {
+	resources, ok := decoded["resources"].(map[string]interface{})
+	if !ok {
+		t.Fatal("missing resources object")
+	}
+	if resources["goroutines"] != float64(4) {
 		t.Fatal("resources lost")
 	}
 }
@@ -105,10 +107,8 @@ func TestRealExpiryFixture(t *testing.T) {
 	if earliest.IsZero() || !latest.After(earliest) {
 		t.Fatalf("spread deadlines not distributed: earliest=%v latest=%v", earliest, latest)
 	}
-	select {
-	case <-m2.state.stopped:
+	if !cleanerRunning(m2) {
 		t.Fatal("cleaner not running after preparation")
-	default:
 	}
 	assertInvariants(t, m2)
 }
@@ -230,11 +230,19 @@ type cacheAction struct {
 	Kind uint8 // 0 read, 1 write, 2 size
 }
 
+// sizeProbeWindow replaces one read in every window of this many planned
+// operations with a Size; the offset keeps the probe away from the window
+// head where reads cluster.
+const (
+	sizeProbeWindow = 100
+	sizeProbeOffset = 10
+)
+
 // buildCacheActions adapts a generated read/write pattern to concrete keys:
 // reads consume readKeys in order, writes consume writeKeys in order, so no
-// key is produced inside the timed loop. With sizeEvery > 0, one read in
-// every window of sizeEvery operations is replaced by a Size.
-func buildCacheActions(cfg workloadConfig, count int, readKeys, writeKeys []string, sizeEvery int) ([]cacheAction, error) {
+// key is produced inside the timed loop. With withSize, one read in every
+// sizeProbeWindow operations is replaced by a Size.
+func buildCacheActions(cfg workloadConfig, count int, readKeys, writeKeys []string, withSize bool) ([]cacheAction, error) {
 	pattern, err := makeWorkload(cfg, count)
 	if err != nil {
 		return nil, err
@@ -245,7 +253,7 @@ func buildCacheActions(cfg workloadConfig, count int, readKeys, writeKeys []stri
 	actions := make([]cacheAction, 0, len(pattern))
 	reads, writes := 0, 0
 	for i, op := range pattern {
-		if sizeEvery > 0 && i%sizeEvery == 10 && op.Read {
+		if withSize && i%sizeProbeWindow == sizeProbeOffset && op.Read {
 			actions = append(actions, cacheAction{Kind: 2})
 			continue
 		}
@@ -314,16 +322,26 @@ func verifyLoadAccounting(r loadResult, canceled bool) error {
 	return nil
 }
 
-func runLoadOnceAt(t *testing.T, cfg loadConfig, start time.Time, op func(uint64) loadOutcome) loadResult {
-	t.Helper()
+// runLoadChecked runs one open-loop load and verifies its accounting. It
+// returns errors instead of failing so it also works off the test goroutine.
+func runLoadChecked(cfg loadConfig, start time.Time, op func(uint64) loadOutcome) (loadResult, error) {
 	clock := newRealLoadClock()
 	defer clock.Close()
 	result, err := runOpenLoop(context.Background(), cfg, start, clock, op)
 	if err != nil {
-		t.Fatalf("open-loop run %v: %v", cfg, err)
+		return loadResult{}, err
 	}
 	if err := verifyLoadAccounting(result, false); err != nil {
-		t.Fatal(err)
+		return loadResult{}, err
+	}
+	return result, nil
+}
+
+func runLoadOnceAt(t *testing.T, cfg loadConfig, start time.Time, op func(uint64) loadOutcome) loadResult {
+	t.Helper()
+	result, err := runLoadChecked(cfg, start, op)
+	if err != nil {
+		t.Fatalf("open-loop run %v: %v", cfg, err)
 	}
 	return result
 }
@@ -346,9 +364,9 @@ func runSteadyScenario(t *testing.T, base perfRecord) perfRecord {
 	wcfg := workloadConfig{Capacity: 1024, KeyCount: 2048, ReadPercent: 95, Distribution: "uniform", Seed: workloadDefaultSeed}
 	keys := make([]string, 2048)
 	for i := range keys {
-		keys[i] = "k" + strconv.Itoa(i)
+		keys[i] = workloadKey(i)
 	}
-	actions, err := buildCacheActions(wcfg, 4096, keys, keys, 0)
+	actions, err := buildCacheActions(wcfg, workloadReplayOps, keys, keys, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -406,11 +424,7 @@ func runExpiryScenario(t *testing.T, base perfRecord, spread time.Duration, with
 	for i := range writeKeys {
 		writeKeys[i] = expiryNewKey(i)
 	}
-	sizeEvery := 0
-	if withSize {
-		sizeEvery = 100
-	}
-	actions, err := buildCacheActions(wcfg, 4096, readKeys, writeKeys, sizeEvery)
+	actions, err := buildCacheActions(wcfg, workloadReplayOps, readKeys, writeKeys, withSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,21 +434,25 @@ func runExpiryScenario(t *testing.T, base perfRecord, spread time.Duration, with
 	m, startAt := prepareRealExpiryCache(t, expiredCount, liveCount, spread)
 	latency := runLoadOnceAt(t, cfg, startAt, cacheActionOp(m, actions))
 
-	// Monitor run: separate fixture and load; pure snapshots only.
+	// Monitor run: separate fixture and load; pure snapshots only. The
+	// reclaim bound covers the 3s load window plus the spread window and
+	// several cleaner ticks with margin.
 	monitor, monitorStart := prepareRealExpiryCache(t, expiredCount, liveCount, spread)
 	monitorDone := make(chan loadResult, 1)
+	monitorFailed := false
 	go func() {
-		clock := newRealLoadClock()
-		defer clock.Close()
-		result, err := runOpenLoop(context.Background(), cfg, monitorStart, clock, cacheActionOp(monitor, actions))
+		result, err := runLoadChecked(cfg, monitorStart, cacheActionOp(monitor, actions))
 		if err != nil {
 			t.Errorf("monitor run: %v", err)
+			monitorFailed = true
 		}
 		monitorDone <- result
 	}()
 	reclaim, reclaimed := waitExpiryReclaimed(monitor, monitorStart, 10*time.Second)
-	if err := verifyLoadAccounting(<-monitorDone, false); err != nil {
-		t.Errorf("monitor run %v", err)
+	if result := <-monitorDone; !monitorFailed {
+		if err := verifyLoadAccounting(result, false); err != nil {
+			t.Errorf("monitor run: %v", err)
+		}
 	}
 
 	base.Config = cfg

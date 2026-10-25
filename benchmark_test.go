@@ -12,11 +12,23 @@ import (
 // here once and reused by all later performance entry points.
 var cachePerfFull = flag.Bool("cache-perf-full", false, "run large cache performance scenarios (slow)")
 
-func BenchmarkCache(b *testing.B) {
-	keys := make([]string, 1024)
+// workloadReplayOps is the pre-generated operation count every workload
+// benchmark replays cyclically; at 4096 it covers the 2048-key space of the
+// 1K tier twice per cycle at every distribution.
+const workloadReplayOps = 4096
+
+// numericKeys returns the "0".."n-1" key pool shared by the plain
+// BenchmarkCache and the payload benchmarks.
+func numericKeys(n int) []string {
+	keys := make([]string, n)
 	for i := range keys {
 		keys[i] = strconv.Itoa(i)
 	}
+	return keys
+}
+
+func BenchmarkCache(b *testing.B) {
+	keys := numericKeys(1024)
 	for _, operation := range []string{"Lookup", "Get", "Set", "RenewTTL"} {
 		b.Run(operation, func(b *testing.B) {
 			m := WithLRU[int](1024, operation == "RenewTTL")
@@ -26,17 +38,33 @@ func BenchmarkCache(b *testing.B) {
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
-				key := keys[i%len(keys)]
-				switch operation {
-				case "Lookup":
-					m.Lookup(key)
-				case "Get":
-					m.Get(key)
-				case "Set":
-					m.Set(key, i)
-				case "RenewTTL":
-					m.SetExpire(key, i, 60)
+			// One wraparound counter and one hoisted loop per operation keep
+			// harness arithmetic (modulo, dispatch) out of the timed region.
+			keyIndex := 0
+			nextKey := func() string {
+				key := keys[keyIndex]
+				keyIndex++
+				if keyIndex == len(keys) {
+					keyIndex = 0
+				}
+				return key
+			}
+			switch operation {
+			case "Lookup":
+				for i := 0; i < b.N; i++ {
+					m.Lookup(nextKey())
+				}
+			case "Get":
+				for i := 0; i < b.N; i++ {
+					m.Get(nextKey())
+				}
+			case "Set":
+				for i := 0; i < b.N; i++ {
+					m.Set(nextKey(), i)
+				}
+			case "RenewTTL":
+				for i := 0; i < b.N; i++ {
+					m.SetExpire(nextKey(), i, 60)
 				}
 			}
 			b.StopTimer()
@@ -51,10 +79,13 @@ func BenchmarkCache(b *testing.B) {
 		b.ReportAllocs()
 		b.ResetTimer()
 		b.RunParallel(func(pb *testing.PB) {
-			i := 0
+			keyIndex := 0
 			for pb.Next() {
-				m.Lookup(keys[i%len(keys)])
-				i++
+				m.Lookup(keys[keyIndex])
+				keyIndex++
+				if keyIndex == len(keys) {
+					keyIndex = 0
+				}
 			}
 		})
 		b.StopTimer()
@@ -62,12 +93,13 @@ func BenchmarkCache(b *testing.B) {
 }
 
 type workloadScenario struct {
-	name        string
-	ttl         bool
-	renew       bool
-	preload     bool
-	keyRatio    int // key pool as a multiple of capacity
-	readPercent int
+	name         string
+	ttl          bool
+	renew        bool
+	preload      bool
+	keyRatio     int // key pool as a multiple of capacity
+	readPercent  int
+	distribution string
 }
 
 // BenchmarkCacheWorkload replays pre-generated deterministic mixes. Keys and
@@ -76,14 +108,14 @@ type workloadScenario struct {
 // the operation slice with their own counters and sum read results locally.
 func BenchmarkCacheWorkload(b *testing.B) {
 	bases := []workloadScenario{
-		{"Hit", false, false, true, 1, 100},
-		{"Miss", false, false, false, 2, 100},
-		{"Overwrite", false, false, true, 1, 0},
-		{"InsertEvict", false, false, true, 2, 0},
-		{"Uniform95", false, false, true, 2, 95},
-		{"Zipf95", false, false, true, 2, 95},
-		{"Scan50", false, false, true, 2, 50},
-		{"RenewTTL", true, true, true, 1, 0},
+		{name: "Hit", preload: true, keyRatio: 1, readPercent: 100, distribution: "uniform"},
+		{name: "Miss", keyRatio: 2, readPercent: 100, distribution: "uniform"},
+		{name: "Overwrite", preload: true, keyRatio: 1, distribution: "uniform"},
+		{name: "InsertEvict", preload: true, keyRatio: 2, distribution: "uniform"},
+		{name: "Uniform95", preload: true, keyRatio: 2, readPercent: 95, distribution: "uniform"},
+		{name: "Zipf95", preload: true, keyRatio: 2, readPercent: 95, distribution: "zipf"},
+		{name: "Scan50", preload: true, keyRatio: 2, readPercent: 50, distribution: "scan"},
+		{name: "RenewTTL", ttl: true, renew: true, preload: true, keyRatio: 1, distribution: "uniform"},
 	}
 	capacities := []int{1024}
 	if *cachePerfFull {
@@ -96,14 +128,8 @@ func BenchmarkCacheWorkload(b *testing.B) {
 				Capacity:     capacity,
 				KeyCount:     scenario.keyRatio * capacity,
 				ReadPercent:  scenario.readPercent,
-				Distribution: "uniform",
+				Distribution: scenario.distribution,
 				Seed:         workloadDefaultSeed,
-			}
-			if scenario.name == "Zipf95" {
-				cfg.Distribution = "zipf"
-			}
-			if scenario.name == "Scan50" {
-				cfg.Distribution = "scan"
 			}
 			name := fmt.Sprintf("%s-cap%d", scenario.name, capacity)
 			b.Run(name, func(b *testing.B) {
@@ -118,7 +144,7 @@ func BenchmarkCacheWorkload(b *testing.B) {
 
 func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadConfig, parallel bool) {
 	b.Helper()
-	ops, err := makeWorkload(cfg, 4096)
+	ops, err := makeWorkload(cfg, workloadReplayOps)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -130,11 +156,10 @@ func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadC
 			preload = cfg.Capacity
 		}
 		for i := 0; i < preload; i++ {
-			key := "k" + strconv.Itoa(i)
 			if scenario.renew {
-				m.SetExpire(key, i, 3600)
+				m.SetExpire(workloadKey(i), i, 3600)
 			} else {
-				m.Set(key, i)
+				m.Set(workloadKey(i), i)
 			}
 		}
 	}
@@ -149,8 +174,13 @@ func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadC
 	b.ResetTimer()
 	if !parallel {
 		checksum := 0
+		opIndex := 0
 		for i := 0; i < b.N; i++ {
-			op := ops[i%len(ops)]
+			op := ops[opIndex]
+			opIndex++
+			if opIndex == len(ops) {
+				opIndex = 0
+			}
 			if op.Read {
 				if value, ok := m.Lookup(op.Key); ok {
 					checksum += value
@@ -160,6 +190,8 @@ func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadC
 			write(op.Key, i)
 		}
 		b.StopTimer()
+		// The checksum is a non-negative sink; this only stops the compiler
+		// from eliding the timed Lookup.
 		if checksum == -1 {
 			b.Fatal("unreachable")
 		}
@@ -167,9 +199,13 @@ func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadC
 	}
 	var reads int64
 	b.RunParallel(func(pb *testing.PB) {
-		local, localReads := 0, 0
+		local, localReads, opIndex := 0, 0, 0
 		for pb.Next() {
-			op := ops[local%len(ops)]
+			op := ops[opIndex]
+			opIndex++
+			if opIndex == len(ops) {
+				opIndex = 0
+			}
 			if op.Read {
 				if value, ok := m.Lookup(op.Key); ok {
 					localReads += value
@@ -182,6 +218,7 @@ func runWorkloadBenchmark(b *testing.B, scenario workloadScenario, cfg workloadC
 		atomic.AddInt64(&reads, int64(localReads))
 	})
 	b.StopTimer()
+	// Same as above: keep the timed reads observable.
 	if reads == -1 {
 		b.Fatal("unreachable")
 	}
