@@ -16,11 +16,11 @@ import (
 // start + floor(id*1s/Rate) regardless of completion speed, queued into a
 // bounded queue, and dropped (never hidden) when the queue is full.
 type loadConfig struct {
-	Rate        int
-	Duration    time.Duration
-	Workers     int
-	Queue       int
-	BurstWindow time.Duration
+	Rate        int           `json:"rate"`
+	Duration    time.Duration `json:"duration"`
+	Workers     int           `json:"workers"`
+	Queue       int           `json:"queue"`
+	BurstWindow time.Duration `json:"burst_window"`
 }
 
 // loadOutcome classifies one completed operation. Read and Write are never
@@ -33,20 +33,31 @@ type loadOutcome struct {
 }
 
 type loadQuantiles struct {
-	Samples int
-	P50     time.Duration
-	P95     time.Duration
-	P99     time.Duration
-	Max     time.Duration
+	Samples int           `json:"samples"`
+	P50     time.Duration `json:"p50"`
+	P95     time.Duration `json:"p95"`
+	P99     time.Duration `json:"p99"`
+	Max     time.Duration `json:"max"`
 }
 
 type loadResult struct {
-	Planned, Attempted, Completed, Dropped, Unissued                          int
-	BurstPlanned, BurstAttempted, BurstCompleted, BurstDropped, BurstUnissued int
-	Reads, Hits                                                               int
-	Elapsed                                                                   time.Duration
-	All, Burst                                                                loadQuantiles
-	Set, BurstSet                                                             loadQuantiles
+	Planned        int           `json:"planned"`
+	Attempted      int           `json:"attempted"`
+	Completed      int           `json:"completed"`
+	Dropped        int           `json:"dropped"`
+	Unissued       int           `json:"unissued"`
+	BurstPlanned   int           `json:"burst_planned"`
+	BurstAttempted int           `json:"burst_attempted"`
+	BurstCompleted int           `json:"burst_completed"`
+	BurstDropped   int           `json:"burst_dropped"`
+	BurstUnissued  int           `json:"burst_unissued"`
+	Reads          int           `json:"reads"`
+	Hits           int           `json:"hits"`
+	Elapsed        time.Duration `json:"elapsed"`
+	All            loadQuantiles `json:"all"`
+	Burst          loadQuantiles `json:"burst"`
+	Set            loadQuantiles `json:"set"`
+	BurstSet       loadQuantiles `json:"burst_set"`
 }
 
 // loadClock is the scheduler's time source: the real clock shares one reused

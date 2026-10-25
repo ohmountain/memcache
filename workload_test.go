@@ -12,11 +12,11 @@ import (
 // be uniform, zipf (s=1.2, v=1), or scan (sequential sweep). Seed 0 selects
 // the fixed default seed so the zero value is deterministic.
 type workloadConfig struct {
-	Capacity     int
-	KeyCount     int
-	ReadPercent  int
-	Distribution string
-	Seed         int64
+	Capacity     int    `json:"capacity"`
+	KeyCount     int    `json:"key_count"`
+	ReadPercent  int    `json:"read_percent"`
+	Distribution string `json:"distribution"`
+	Seed         int64  `json:"seed"`
 }
 
 type workloadOp struct {
