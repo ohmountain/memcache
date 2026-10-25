@@ -74,11 +74,19 @@ A write inserts or cancels a TTL record in O(log n) and is otherwise O(1)
 excluding lock acquisition. A new key on a full cache reclaims exactly one entry
 — a due heap root when one exists, otherwise the LRU tail — in O(log n); writes
 no longer purge every due entry. `Size()` purges all due entries in O(k log n),
-where k entries have expired. Background cleanup still runs one goroutine per
-positive-capacity TTL cache and purges due entries; its current 100ms ticker may
-reclaim more than one entry at a time. Close waits for it to stop. Capacity does
-not bound the size of user payloads or the number of cache instances created by
-an application.
+where k entries have expired.
+
+Background cleanup keeps one worker per positive-capacity TTL cache and no
+global scheduler. An empty expiry heap has no timer at all: the worker waits for
+a change, so an idle instance is not woken periodically. When a deadline exists,
+the worker sleeps until the earliest one and reclaims at most 64 due entries per
+batch, yielding between batches. A write that changes the earliest deadline
+wakes the worker through a one-slot coalescing notification; a timer event is
+only a hint to re-read the heap, never a deadline of its own. Reclamation is
+best-effort — it is not a promise that payloads are freed within a fixed number
+of milliseconds. Close stops the timer, waits for the worker, and is safe to
+repeat. Capacity does not bound the size of user payloads or the number of cache
+instances created by an application.
 
 ## Compatibility notes
 

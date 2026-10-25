@@ -189,3 +189,85 @@ func TestHistoryRenewalAndCleanup(t *testing.T) {
 	requireValue(t, m, "k", 2)
 	assertInvariants(t, m)
 }
+
+// newCleanerHistoryFixture builds a TTL cache with the real worker running on a
+// synchronized fake clock, so the history interleavings below exercise the
+// scheduler rather than an explicit cleanup call.
+func newCleanerHistoryFixture(tb testing.TB, capacity uint) (*Memcache[int], *fakeClock) {
+	tb.Helper()
+	fake := newFakeClock(modelEpoch)
+	m := newMemcacheWithClock[int](capacity, true, fake, true)
+	tb.Cleanup(m.Close)
+	return m, fake
+}
+
+// requireValidFrozenHistory records programs on m and requires the checker to
+// find a serialization that also reproduces the frozen-moment final state. A
+// background batch is intentionally not a recorded event: it only removes
+// entries that were already invisible at the model's frozen now, so it must
+// not invalidate a history.
+func requireValidFrozenHistory(t *testing.T, m *Memcache[int], model *cacheModel, programs [][]modelOp) {
+	t.Helper()
+	events := recordHistory(m, programs)
+	final := snapshotCache(m)
+	verdict, _ := checkHistory(model, events, &final, historyDefaultBudget)
+	if verdict != historyValid {
+		t.Fatalf("verdict %q, history: %+v", verdict, events)
+	}
+	assertInvariants(t, m)
+}
+
+// TestHistoryCleanerInterleavings drives the real worker against concurrent
+// operations at one frozen logical instant: a renewal racing the first batch,
+// Clear racing a batch, and Close racing a write. Every program stays within
+// the checker's eight-event bound, and inconclusive remains a failure.
+func TestHistoryCleanerInterleavings(t *testing.T) {
+	t.Run("renewal races one batch", func(t *testing.T) {
+		m, fake := newCleanerHistoryFixture(t, 1)
+		ch := seamSignals(fake)
+		m.SetExpire("k", 1, 1)
+		waitArmedDelay(t, ch, fake, time.Second)
+		fake.Advance(time.Second) // the seeded entry is now due
+		// Deliver the deadline so the batch really races the renewal.
+		fake.timer(0).fire()
+		model := newCacheModel(1, true, modelEpoch)
+		model.apply(modelOp{Kind: 1, Key: "k", Value: 1, TTL: 1})
+		model.now = modelEpoch.Add(time.Second)
+		requireValidFrozenHistory(t, m, model, [][]modelOp{
+			{{Kind: 1, Key: "k", Value: 2, TTL: 3600}, {Kind: 2, Key: "k"}},
+		})
+		requireValue(t, m, "k", 2)
+	})
+
+	t.Run("clear races one batch", func(t *testing.T) {
+		m, fake := newCleanerHistoryFixture(t, 4)
+		ch := seamSignals(fake)
+		m.SetExpire("a", 1, 1)
+		m.SetExpire("b", 2, 1)
+		waitArmedDelay(t, ch, fake, time.Second)
+		fake.Advance(time.Second)
+		fake.timer(0).fire()
+		model := newCacheModel(4, true, modelEpoch)
+		model.apply(modelOp{Kind: 1, Key: "a", Value: 1, TTL: 1})
+		model.apply(modelOp{Kind: 1, Key: "b", Value: 2, TTL: 1})
+		model.now = modelEpoch.Add(time.Second)
+		requireValidFrozenHistory(t, m, model, [][]modelOp{
+			{{Kind: 2, Key: "a"}},
+			{{Kind: 4}, {Kind: 0, Key: "c", Value: 3}},
+		})
+	})
+
+	t.Run("close races one write", func(t *testing.T) {
+		m, _ := newCleanerHistoryFixture(t, 2)
+		m.SetExpire("seed", 0, 3600) // keep a worker and timer alive
+		model := newCacheModel(2, true, modelEpoch)
+		model.apply(modelOp{Kind: 1, Key: "seed", Value: 0, TTL: 3600})
+		requireValidFrozenHistory(t, m, model, [][]modelOp{
+			{{Kind: 0, Key: "k", Value: 1}},
+			{{Kind: 9}},
+		})
+		if m.Size() != 0 {
+			t.Fatalf("closed cache Size = %d, want 0", m.Size())
+		}
+	})
+}

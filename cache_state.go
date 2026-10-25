@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-const cleanerInterval = 100 * time.Millisecond
 const maxTTL = time.Duration(1<<63 - 1)
 
 // cacheState is retained by the registry and cleaner, independently of the
@@ -21,8 +20,11 @@ type cacheState[T CacheAble] struct {
 	enableExpired bool
 	// clock is the single time source: now is its deadline function and
 	// clock.Now drives scheduling, so both read the same injected clock.
-	clock   cacheClock
-	now     func() time.Time
+	clock cacheClock
+	now   func() time.Time
+	// wake is a one-slot invalidation signal for the cleaner. It carries no
+	// deadline: a notification only means "re-read the real heap root".
+	wake    chan struct{}
 	closed  bool
 	done    chan struct{}
 	stopped chan struct{}
@@ -33,6 +35,10 @@ func (s *cacheState[T]) set(key string, value T, ttl int64, expiring bool) {
 	defer s.mu.Unlock()
 	if s.closed || s.capacity == 0 {
 		return
+	}
+	if s.wake != nil {
+		before := s.nextExpiryLocked()
+		defer s.notifyCleanerLocked(before)
 	}
 	expiring = expiring && s.enableExpired
 	if expiring && ttl <= 0 {
@@ -98,6 +104,10 @@ func (s *cacheState[T]) reclaimSlotLocked(now time.Time) {
 func (s *cacheState[T]) lookup(key string) (T, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.wake != nil {
+		before := s.nextExpiryLocked()
+		defer s.notifyCleanerLocked(before)
+	}
 	n, ok := s.holder[key]
 	if ok && !n.expiresAt.IsZero() && !n.expiresAt.After(s.now()) {
 		s.removeLocked(n)
@@ -114,6 +124,10 @@ func (s *cacheState[T]) lookup(key string) (T, bool) {
 func (s *cacheState[T]) delete(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.wake != nil {
+		before := s.nextExpiryLocked()
+		defer s.notifyCleanerLocked(before)
+	}
 	if n, ok := s.holder[key]; ok {
 		s.removeLocked(n)
 	}
@@ -134,15 +148,61 @@ func (s *cacheState[T]) purgeExpiredLocked(now time.Time) {
 	}
 }
 
+// nextExpiryLocked reports the earliest deadline currently in the heap, or the
+// zero time when nothing is expiring. It is the only scheduling input.
+func (s *cacheState[T]) nextExpiryLocked() time.Time {
+	if len(s.expiry) == 0 {
+		return time.Time{}
+	}
+	return s.expiry[0].expiresAt
+}
+
+// notifyCleanerLocked invalidates the worker's cached deadline when the real
+// heap root changed during this operation. The notification is a non-blocking
+// one-slot send: repeated changes coalesce, and a dropped send is harmless
+// because the worker re-reads the current root after every wake.
+func (s *cacheState[T]) notifyCleanerLocked(before time.Time) {
+	if s.wake == nil {
+		return
+	}
+	if s.nextExpiryLocked().Equal(before) {
+		return
+	}
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// purgeExpiredBatchLocked removes at most limit entries whose deadline is at or
+// before now, taking them from the heap root only. It never scans the heap or
+// the map, so a batch costs O(limit log n).
+func (s *cacheState[T]) purgeExpiredBatchLocked(now time.Time, limit int) int {
+	removed := 0
+	for removed < limit && len(s.expiry) > 0 && !s.expiry[0].expiresAt.After(now) {
+		s.removeLocked(s.expiry[0])
+		removed++
+	}
+	return removed
+}
+
 func (s *cacheState[T]) checkExpired() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.wake != nil {
+		before := s.nextExpiryLocked()
+		defer s.notifyCleanerLocked(before)
+	}
 	s.purgeExpiredLocked(s.now())
 }
 
 func (s *cacheState[T]) Size() uint {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.wake != nil {
+		before := s.nextExpiryLocked()
+		defer s.notifyCleanerLocked(before)
+	}
 	s.purgeExpiredLocked(s.now())
 	return uint(len(s.holder))
 }
@@ -152,9 +212,14 @@ func (s *cacheState[T]) Cap() uint { return s.capacity }
 func (s *cacheState[T]) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.closed {
-		s.clearLocked()
+	if s.closed {
+		return
 	}
+	if s.wake != nil {
+		before := s.nextExpiryLocked()
+		defer s.notifyCleanerLocked(before)
+	}
+	s.clearLocked()
 }
 
 func (s *cacheState[T]) clearLocked() {
@@ -174,18 +239,4 @@ func (s *cacheState[T]) close() {
 	// Never hold the cache lock while acquiring the registry lock.
 	lives.remove(s)
 	<-s.stopped
-}
-
-func (s *cacheState[T]) runCleaner() {
-	ticker := time.NewTicker(cleanerInterval)
-	defer close(s.stopped)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.done:
-			return
-		case <-ticker.C:
-			s.checkExpired()
-		}
-	}
 }

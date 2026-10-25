@@ -29,6 +29,12 @@ func newMemcache[T CacheAble](capacity uint, enableExpired bool, now func() time
 // newMemcacheWithClock is the shared constructor: the injected clock supplies
 // both deadline reads (state.now) and cleaner scheduling (state.clock).
 func newMemcacheWithClock[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool) *Memcache[T] {
+	// Only TTL caches with usable capacity need a scheduler notification
+	// channel; every other cache keeps the notification fast path off.
+	var wake chan struct{}
+	if enableExpired && capacity > 0 {
+		wake = make(chan struct{}, 1)
+	}
 	s := &cacheState[T]{
 		capacity:      capacity,
 		holder:        make(map[string]*node[T]),
@@ -36,6 +42,7 @@ func newMemcacheWithClock[T CacheAble](capacity uint, enableExpired bool, clock 
 		enableExpired: enableExpired,
 		clock:         clock,
 		now:           clock.Now,
+		wake:          wake,
 		done:          make(chan struct{}),
 		stopped:       make(chan struct{}),
 	}

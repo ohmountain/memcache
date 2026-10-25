@@ -86,18 +86,23 @@ func (t *cleanerTimer) consumed() {
 
 // arm creates the timer once and reschedules it. An armed timer that has not
 // been consumed is stopped first; if Stop reports the event already fired, the
-// worker (the only receiver) drains it before Reset.
-func (t *cleanerTimer) arm(clock cacheClock, delay time.Duration) {
+// worker (the only receiver) drains it before Reset. It reports whether it
+// drained a fired event, which tells the worker to re-read the heap instead of
+// trusting the delay it computed from an older clock sample.
+func (t *cleanerTimer) arm(clock cacheClock, delay time.Duration) bool {
 	if t.timer == nil {
 		t.timer = clock.NewTimer(delay)
 		t.state = cleanerTimerArmed
-		return
+		return false
 	}
+	drained := false
 	if t.state == cleanerTimerArmed && !t.timer.Stop() {
 		<-t.timer.C()
+		drained = true
 	}
 	t.timer.Reset(delay)
 	t.state = cleanerTimerArmed
+	return drained
 }
 
 // stop releases the timer. Only an armed timer can have a pending event; a
