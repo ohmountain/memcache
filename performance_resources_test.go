@@ -99,10 +99,18 @@ func readHeapStats() (heapAlloc, heapObjects uint64) {
 
 // runIdleScenario observes capacity-1 TTL instances with an empty heap
 // (idle-empty) or one 3600s entry each (idle-future) for a fixed 3s window
-// carrying only a 1 rps no-op load. empty_heap_checks comes from an
-// instrumented now() (atomic increment per call): this run honestly reports
-// the current ticker behavior with its instrumentation overhead; Stage A
-// makes no "no periodic wake-up" claim.
+// carrying only a 1 rps no-op load.
+//
+// Both counters come from an instrumented now() (one atomic increment per
+// call), which adds that overhead to every sample. empty_heap_checks is the
+// total since construction, kept for compatibility with older records: it
+// includes one deadline read per initial write plus the worker's startup
+// observation, so it is not "periodic wakes". window_now_checks counts only
+// calls made inside the observation window, which is the number that shows
+// whether an idle instance wakes periodically. Neither counter proves by
+// itself that no timer exists; that proof is cleaner_test.go's fake-timer
+// event record (TestCleanerEmptyHeapSleeps), which asserts no timer is created
+// for an empty heap and no clock read happens without a change.
 func runIdleScenario(t *testing.T, base perfRecord, future bool) perfRecord {
 	switch *perfInstances {
 	case 1, 100, 1000:
@@ -136,13 +144,18 @@ func runIdleScenario(t *testing.T, base perfRecord, future bool) perfRecord {
 		base.InitialExpiring = *perfInstances
 	}
 	windowStart := time.Now()
+	windowCallsStart := atomic.LoadUint64(&nowCalls)
 	base.Load = runLoadOnceAt(t, cfg, windowStart, func(uint64) loadOutcome { return loadOutcome{} })
 	// The last 1 rps request is planned 2s into the 3s window, so the load
-	// alone would stop there; hold the full observation window open before
-	// sampling resources and ticker checks.
+	// alone would stop there. The settled tail below starts once the load has
+	// finished: workers have long since made their startup observation, so any
+	// clock call in the tail would be a periodic wake, not initialization.
+	tailCallsStart := atomic.LoadUint64(&nowCalls)
 	if remain := time.Until(windowStart.Add(cfg.Duration)); remain > 0 {
 		time.Sleep(remain)
 	}
+	windowCalls := atomic.LoadUint64(&nowCalls) - windowCallsStart
+	tailCalls := atomic.LoadUint64(&nowCalls) - tailCallsStart
 	heapAlloc, heapObjects := readHeapStats()
 	base.Resources = map[string]uint64{
 		"heap_alloc_bytes":  heapAlloc,
@@ -151,8 +164,11 @@ func runIdleScenario(t *testing.T, base perfRecord, future bool) perfRecord {
 		"registered_caches": uint64(Lives() - before),
 		"owned_workers":     ownedWorkersRunning(caches),
 		"empty_heap_checks": atomic.LoadUint64(&nowCalls),
+		"window_now_checks": windowCalls,
+		"tail_now_checks":   tailCalls,
 	}
-	t.Logf("idle run: empty_heap_checks counted through an instrumented now() (adds one atomic increment per call)")
+	t.Logf("idle run: empty_heap_checks=%d total, window_now_checks=%d inside the 3s window, tail_now_checks=%d after the load finished (instrumented now() adds one atomic increment per call)",
+		atomic.LoadUint64(&nowCalls), windowCalls, tailCalls)
 	return base
 }
 
