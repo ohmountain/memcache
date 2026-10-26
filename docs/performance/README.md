@@ -262,3 +262,30 @@ two halves and comparing them with benchstat before believing any delta.
   measured, unimplemented opportunities (per-instance memory, the lock-bound
   sharded read ceiling, opt-in eviction policies, TTL heap cost) and their
   evidence.
+- `2026-10-26-round3-optimizations.md` — the third measured round: the cleaner is
+  woken only when an earliest deadline moves earlier or a heap empties, so
+  sustained TTL renewal no longer spins the worker on every shard lock
+  (`RenewTTL` −12% at 24 threads; the worker leaves the CPU profile entirely);
+  per-instance fixed cost drops 38–46% (`805.8 → 498.7 B` non-TTL,
+  `910.4 → 496.0 B` TTL-idle, `10.4 → 6.4` objects, create+close `367 → 226 ns`),
+  which finally meets the Stage 3 "1000 idle TTL caches ≤ 0.5 MB" gate at
+  0.47 MiB; a 192-byte, 64-byte-aligned shard replaces the phase-dependent
+  208-byte padding; and a concurrent second `Close` now waits for the first one
+  to empty and unregister the cache. It also records the measured negative
+  results (a shard-lock clock hoist that cost 27% on the default single-shard
+  configuration and was reverted, RWMutex read paths, batch APIs, partition
+  purge) and the deferred architecture items (approximate recency, floating
+  per-shard capacity, the 64-slot shard floor).
+- `2026-10-26-round3-audit.md` — the independent audit of round 3: every number in
+  the round-3 report re-derived (per-instance footprint with an exact allocation
+  counter: `803.5 → 488.5 B`, gate `0.880 → 0.452 MiB`), the cleaner wake filter
+  exercised end-to-end through the public API on 1/4/64 shards, and the change
+  attacked with mutation testing. It found that the `extends` deadline-direction
+  comparison and the "never wake for a later root" policy were both unprotected
+  by tests (a plausible simplification of either passed the whole suite), that
+  the concurrent-`Close` regression test only detected the old bug in 14 of 20
+  runs, and that the library panicked on 32-bit targets on an unaligned 64-bit
+  atomic. All four are fixed here; the report numbers that were imprecise (net
+  `+8 B` rather than `+16 B`, `InsertEvict` `+5.3%` in the independent-process
+  set, a stale `ab.sh` output that reproduces a pre-revert state) are corrected
+  in place.
