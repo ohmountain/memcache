@@ -82,7 +82,7 @@ func TestApproximateReadsBoundary(t *testing.T) {
 // misses once the worker has reclaimed it.
 func TestApproximateReadsCleanerPublishes(t *testing.T) {
 	fake := newFakeClock(modelEpoch)
-	m := newMemcacheWithClockShards[int](16, true, fake, true, 1, false, true, true)
+	m := newMemcacheWithClockShards[int](16, true, fake, true, 1, shardSlotTarget, false, true, true)
 	t.Cleanup(m.Close)
 	ch := seamSignals(fake)
 	m.SetExpire("a", 1, 1)

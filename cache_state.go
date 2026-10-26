@@ -107,11 +107,18 @@ type cacheState[T CacheAble] struct {
 	closed        uint32
 }
 
-func shardCount(capacity uint, requested int) int {
+// shardCount derives the shard count from the capacity, the request, and the
+// slot floor. A slotTarget below one selects the default floor; the request
+// is rounded down to a power of two and capped so no shard is sized below
+// about slotTarget slots.
+func shardCount(capacity uint, requested int, slotTarget int) int {
 	if capacity == 0 || requested <= 1 {
 		return 1
 	}
-	maxN := int(capacity) / shardSlotTarget
+	if slotTarget < 1 {
+		slotTarget = shardSlotTarget
+	}
+	maxN := int(capacity) / slotTarget
 	if maxN < 1 {
 		maxN = 1
 	}
@@ -160,8 +167,8 @@ func read8(s string) uint64 {
 		uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56
 }
 
-func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, shards int, preallocate bool, collectStats bool, approxReads bool) *cacheState[T] {
-	n := shardCount(capacity, shards)
+func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, shards int, slotTarget int, preallocate bool, collectStats bool, approxReads bool) *cacheState[T] {
+	n := shardCount(capacity, shards, slotTarget)
 	s := &cacheState[T]{
 		mask:          uint64(n - 1),
 		capacity:      capacity,

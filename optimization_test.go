@@ -591,7 +591,7 @@ func TestShardCountRoundsDown(t *testing.T) {
 		{4096, 65, 64},
 		{100, 16, 1},
 	} {
-		if got := shardCount(tc.capacity, tc.requested); got != tc.want {
+		if got := shardCount(tc.capacity, tc.requested, shardSlotTarget); got != tc.want {
 			t.Errorf("shardCount(%d, %d) = %d, want %d", tc.capacity, tc.requested, got, tc.want)
 		}
 	}
@@ -657,7 +657,7 @@ func TestMassRemovalBoundsFreelist(t *testing.T) {
 
 func TestMassExpiryReleasesHeapBacking(t *testing.T) {
 	clock := &testClock{now: modelEpoch}
-	m := newMemcacheWithClockShards[int](4096, true, systemClock{now: clock.Now}, false, 1, false, true, false)
+	m := newMemcacheWithClockShards[int](4096, true, systemClock{now: clock.Now}, false, 1, shardSlotTarget, false, true, false)
 	defer m.Close()
 	for i := 0; i < 4096; i++ {
 		m.SetExpire(workloadKey(i), i, 1)

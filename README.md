@@ -69,8 +69,10 @@ func main() {
   seeded hash to per-shard map/list/heap sets, capacity is split evenly, and LRU
   becomes approximate (a global hit cannot protect a victim in another shard).
   Shards are rounded down to a power of two and capped so no shard is sized
-  below about 64 slots. Preallocation is off by default; `Preallocate` trades
-  memory for fewer map-growth stalls.
+  below about 64 slots — `Options.ShardSlots` lowers that floor for small
+  caches (16 slots let a 1024-entry cache use 64 shards) at the cost of a
+  coarser approximate LRU. Preallocation is off by default; `Preallocate`
+  trades memory for fewer map-growth stalls.
 - `Options.DisableStats` turns off the hit/miss/set/delete/eviction/expiration
   counters. Each counter update dirties a shard cache line that `Peek` otherwise
   only reads, so disabling them raises multicore read throughput (about 15% at
