@@ -2,35 +2,38 @@ package memcache
 
 import (
 	"runtime"
+	"time"
 )
 
-// defaultCleanupBatchSize bounds one background reclamation batch. Stage B uses
-// an internal default; publishing a Config field is Stage C work.
+// defaultCleanupBatchSize bounds one background reclamation batch. The worker
+// raises it for very large expiry heaps so a million-entry sweep is not split
+// into tens of thousands of lock round-trips.
 const defaultCleanupBatchSize = 64
 
 // runCleaner is the one worker of a positive-capacity TTL cache. It is the
-// timer's only owner and receiver, and it never holds the cache lock while
+// timer's only owner and receiver, and it never holds a shard lock while
 // waiting, arming, stopping, or draining the timer.
 //
 // Each round invalidates everything the worker previously knew: it samples the
-// clock, reads the real heap root under the lock, and then either sleeps with no
-// timer (empty heap), waits for the earliest deadline, or reclaims at most one
+// clock, reads the earliest deadline across shards, and then either sleeps with
+// no timer (empty heaps), waits for that deadline, or reclaims one bounded
 // batch. A wake carries no deadline, so a coalesced notification can never make
 // the worker act on stale state.
 func (s *cacheState[T]) runCleaner() {
 	var timer cleanerTimer
-	defer close(s.stopped)
+	defer s.closeStopped()
 	defer timer.stop()
 	for {
-		now := s.clock.Now()
-		s.mu.Lock()
-		closed := s.closed
-		due := s.nextExpiryLocked()
-		s.mu.Unlock()
-		if closed {
+		now := s.nowNanos()
+		if s.isClosed() {
 			return
 		}
-		if due.IsZero() {
+		due, expiryRecords := s.deadlineSnapshot()
+		if s.isClosed() {
+			// Close may have landed while the snapshot held shard locks.
+			return
+		}
+		if due == 0 {
 			// No deadline: no timer at all, and no periodic clock reads.
 			timer.stop()
 			select {
@@ -40,11 +43,11 @@ func (s *cacheState[T]) runCleaner() {
 				continue
 			}
 		}
-		if due.After(now) {
-			// All timer management happens outside the cache lock. If arming
-			// drained an event that had already fired, the current heap root
-			// may now be due, so re-read it instead of waiting.
-			if timer.arm(s.clock, due.Sub(now)) {
+		if due > now {
+			// All timer management happens outside every shard lock. If arming
+			// drained an event that had already fired, the current roots may now
+			// be due, so re-read them instead of waiting.
+			if timer.arm(s.clock, time.Duration(due-now)) {
 				continue
 			}
 			select {
@@ -57,23 +60,17 @@ func (s *cacheState[T]) runCleaner() {
 				continue
 			}
 		}
-		s.mu.Lock()
-		if s.closed {
-			s.mu.Unlock()
-			return
-		}
-		removed := s.purgeExpiredBatchLocked(now, defaultCleanupBatchSize)
-		s.mu.Unlock()
+		removed := s.purgeDueBatch(now, cleanupBatchSize(expiryRecords))
 		if removed == 0 {
-			// The root changed between the read and the lock; re-read it.
+			// A root changed between the read and the lock; re-read it.
 			continue
 		}
-		// Between batches, prefer shutdown and let foreground writers run.
 		select {
 		case <-s.done:
 			return
 		default:
 		}
+		// Yield between batches so foreground writers are not starved.
 		runtime.Gosched()
 	}
 }

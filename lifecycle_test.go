@@ -105,9 +105,7 @@ func TestCleanerRuns(t *testing.T) {
 	m := testCache(t, 1, true)
 	m.SetExpire("k", 1, 1)
 	waitUntil(t, "background expiration", func() bool {
-		m.state.mu.Lock()
-		defer m.state.mu.Unlock()
-		return len(m.state.holder) == 0
+		return m.state.Len() == 0
 	})
 }
 

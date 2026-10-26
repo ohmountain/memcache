@@ -16,8 +16,10 @@ type snapshotItem struct {
 	ExpiryIndex int
 }
 
-// cacheSnapshot is a lock-held copy of the complete physical state. Taking it
-// must not purge, refresh recency, or read the clock.
+// cacheSnapshot is a copy of the complete physical state, taken shard by shard.
+// Taking it must not purge, refresh recency, or read the clock. Each shard is
+// locked independently, so the result is atomic only for a single-shard cache;
+// all current callers use one shard.
 type cacheSnapshot struct {
 	Capacity uint
 	Closed   bool
@@ -28,22 +30,27 @@ type cacheSnapshot struct {
 
 func snapshotCache(m *Memcache[int]) cacheSnapshot {
 	s := m.state
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	snap := cacheSnapshot{
 		Capacity: s.capacity,
-		Closed:   s.closed,
-		Items:    make(map[string]snapshotItem, len(s.holder)),
-		Order:    make([]string, 0, s.order.Len()),
-		Heap:     make([]string, 0, len(s.expiry)),
+		Closed:   s.isClosed(),
+		Items:    make(map[string]snapshotItem),
+		Order:    make([]string, 0),
+		Heap:     make([]string, 0),
 	}
-	for e := s.order.Front(); e != nil; e = e.Next() {
-		n := e.Value.(*node[int])
-		snap.Items[n.key] = snapshotItem{Value: n.value, Deadline: n.expiresAt, ExpiryIndex: n.expiryIndex}
-		snap.Order = append(snap.Order, n.key)
-	}
-	for _, n := range s.expiry {
-		snap.Heap = append(snap.Heap, n.key)
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		for n := sh.head; n != nil; n = n.next {
+			var deadline time.Time
+			if n.deadline != 0 {
+				deadline = s.start.Add(time.Duration(n.deadline))
+			}
+			snap.Items[n.key] = snapshotItem{Value: n.value, Deadline: deadline, ExpiryIndex: n.expiryIndex}
+			snap.Order = append(snap.Order, n.key)
+		}
+		for _, n := range sh.heap {
+			snap.Heap = append(snap.Heap, n.key)
+		}
+		sh.mu.Unlock()
 	}
 	return snap
 }

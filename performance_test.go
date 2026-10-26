@@ -1,7 +1,6 @@
 package memcache
 
 import (
-	"container/heap"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -199,8 +198,8 @@ func expiryNewKey(i int) string     { return fmt.Sprintf("%s%06d", expiryNewPref
 // plus live permanent ones on the real clock. Deadlines are rewritten under
 // the cache lock after filling — uniform (spread=0) or evenly spread over
 // (base, base+spread] — so filling time never distorts the deadline
-// distribution; heap.Init rebuilds the index. The cleaner is started exactly
-// once by re-arming the stopped channel the constructor closed. The returned
+// distribution; heap.rebuild refreshes the index. The cleaner is then started
+// explicitly because this fixture bypasses the public constructor. The returned
 // time is the earliest deadline, the moment measurement starts from. No
 // concurrent operation or Close may happen during preparation.
 func prepareRealExpiryCache(tb testing.TB, expired, live int, spread time.Duration) (*Memcache[int], time.Time) {
@@ -217,19 +216,26 @@ func prepareRealExpiryCache(tb testing.TB, expired, live int, spread time.Durati
 		m.Set(expiryLiveKey(i), i)
 	}
 	s := m.state
-	s.mu.Lock()
+	sh := s.shards[0]
+	sh.mu.Lock()
 	base := time.Now().Add(time.Second)
 	for i := 0; i < expired; i++ {
 		deadline := base
 		if spread > 0 {
 			deadline = base.Add(time.Duration(int64(spread) * int64(i+1) / int64(expired)))
 		}
-		s.holder[expiryExpiredKey(i)].expiresAt = deadline
+		sh.m[expiryExpiredKey(i)].deadline = int64(deadline.Sub(s.start))
 	}
-	heap.Init(&s.expiry)
-	s.stopped = make(chan struct{})
-	go s.runCleaner()
-	s.mu.Unlock()
+	sh.heap = sh.heap[:0]
+	for _, n := range sh.m {
+		if n.deadline != 0 {
+			sh.heap = append(sh.heap, n)
+		}
+	}
+	sh.heap.rebuild()
+	sh.mu.Unlock()
+
+	s.startWorkerNow()
 	return m, base
 }
 

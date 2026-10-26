@@ -8,44 +8,78 @@ import (
 func assertInvariants(t testing.TB, m *Memcache[int]) {
 	t.Helper()
 	s := m.state
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.holder) != s.order.Len() || uint(len(s.holder)) > s.capacity {
-		t.Fatalf("inconsistent size: map=%d list=%d capacity=%d", len(s.holder), s.order.Len(), s.capacity)
+	total := 0
+	for _, sh := range s.shards {
+		sh.mu.Lock()
+		if sh.size != len(sh.m) || sh.size > sh.cap {
+			sh.mu.Unlock()
+			t.Fatalf("inconsistent shard size: map=%d size=%d cap=%d", len(sh.m), sh.size, sh.cap)
+		}
+		total += sh.size
+		seen := make(map[string]bool, len(sh.m))
+		var prev *node[int]
+		for n := sh.head; n != nil; n = n.next {
+			if n.prev != prev {
+				sh.mu.Unlock()
+				t.Fatal("LRU links disagree")
+			}
+			if seen[n.key] || sh.m[n.key] != n {
+				sh.mu.Unlock()
+				t.Fatal("list and index disagree")
+			}
+			seen[n.key] = true
+			if (n.deadline == 0) != (n.expiryIndex == -1) {
+				sh.mu.Unlock()
+				t.Fatal("deadline and heap membership disagree")
+			}
+			if n.expiryIndex >= 0 && (n.expiryIndex >= len(sh.heap) || sh.heap[n.expiryIndex] != n) {
+				sh.mu.Unlock()
+				t.Fatal("incorrect expiry index")
+			}
+			prev = n
+		}
+		if sh.tail != prev {
+			sh.mu.Unlock()
+			t.Fatal("LRU tail disagrees")
+		}
+		if len(seen) != len(sh.m) {
+			sh.mu.Unlock()
+			t.Fatalf("list holds %d entries, map holds %d", len(seen), len(sh.m))
+		}
+		for i, n := range sh.heap {
+			if n.expiryIndex != i || sh.m[n.key] != n || n.deadline == 0 {
+				sh.mu.Unlock()
+				t.Fatal("stale expiry entry")
+			}
+			if i > 0 && n.deadline < sh.heap[(i-1)/2].deadline {
+				sh.mu.Unlock()
+				t.Fatal("expiry heap is out of order")
+			}
+		}
+		if len(sh.heap) > len(sh.m) {
+			sh.mu.Unlock()
+			t.Fatal("expiry metadata exceeds shard size")
+		}
+		sh.mu.Unlock()
 	}
-	seen := make(map[string]bool, len(s.holder))
-	for e := s.order.Front(); e != nil; e = e.Next() {
-		n := e.Value.(*node[int])
-		if seen[n.key] || s.holder[n.key] != n || n.element != e {
-			t.Fatal("list and index disagree")
-		}
-		seen[n.key] = true
-		if n.expiresAt.IsZero() != (n.expiryIndex == -1) {
-			t.Fatal("deadline and heap membership disagree")
-		}
-		if n.expiryIndex >= 0 && (n.expiryIndex >= len(s.expiry) || s.expiry[n.expiryIndex] != n) {
-			t.Fatal("incorrect expiry index")
-		}
-	}
-	for i, n := range s.expiry {
-		if n.expiryIndex != i || s.holder[n.key] != n || n.expiresAt.IsZero() {
-			t.Fatal("stale expiry entry")
-		}
-		if i > 0 && n.expiresAt.Before(s.expiry[(i-1)/2].expiresAt) {
-			t.Fatal("expiry heap is out of order")
-		}
-	}
-	if len(s.expiry) > len(s.holder) {
-		t.Fatal("expiry metadata exceeds cache size")
+	if uint(total) > s.capacity {
+		t.Fatalf("cache holds %d entries over capacity %d", total, s.capacity)
 	}
 }
 
 func requireOrder(t *testing.T, m *Memcache[int], want ...string) {
 	t.Helper()
+	if len(m.state.shards) != 1 {
+		t.Fatalf("requireOrder is only meaningful for one shard, got %d", len(m.state.shards))
+	}
 	assertInvariants(t, m)
 	var got []string
-	for e := m.state.order.Front(); e != nil; e = e.Next() {
-		got = append(got, e.Value.(*node[int]).key)
+	for _, sh := range m.state.shards {
+		sh.mu.Lock()
+		for n := sh.head; n != nil; n = n.next {
+			got = append(got, n.key)
+		}
+		sh.mu.Unlock()
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("LRU order = %v, want %v", got, want)

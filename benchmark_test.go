@@ -30,7 +30,7 @@ func numericKeys(n int) []string {
 
 func BenchmarkCache(b *testing.B) {
 	keys := numericKeys(1024)
-	for _, operation := range []string{"Lookup", "Get", "Set", "RenewTTL"} {
+	for _, operation := range []string{"Lookup", "Peek", "Get", "Set", "RenewTTL"} {
 		b.Run(operation, func(b *testing.B) {
 			m := WithLRU[int](1024, operation == "RenewTTL")
 			defer m.Close()
@@ -54,6 +54,10 @@ func BenchmarkCache(b *testing.B) {
 			case "Lookup":
 				for i := 0; i < b.N; i++ {
 					m.Lookup(nextKey())
+				}
+			case "Peek":
+				for i := 0; i < b.N; i++ {
+					m.Peek(nextKey())
 				}
 			case "Get":
 				for i := 0; i < b.N; i++ {
@@ -286,5 +290,68 @@ func TestWorkloadScanSustainsEviction(t *testing.T) {
 			}
 			t.Logf("cap %d cycle %d: %d write misses across %d ops", capacity, cycle, misses, len(ops))
 		}
+	}
+}
+
+// BenchmarkCacheSharded measures the opt-in sharded read path. Workers start
+// at different keys so they are not all queueing on one shard; a lockstep
+// workload is deliberately left to BenchmarkCache/ParallelLookup.
+func BenchmarkCacheSharded(b *testing.B) {
+	keys := numericKeys(1024)
+	for _, shards := range []int{1, 8, 16, 64} {
+		shards := shards
+		b.Run(fmt.Sprintf("Shards%d", shards), func(b *testing.B) {
+			m := WithOptions[int](Options{Capacity: 4096, Shards: shards})
+			defer m.Close()
+			for i, key := range keys {
+				m.Set(key, i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			var worker int64
+			b.RunParallel(func(pb *testing.PB) {
+				w := int(atomic.AddInt64(&worker, 1) - 1)
+				keyIndex := (w * 997) % len(keys)
+				for pb.Next() {
+					m.Lookup(keys[keyIndex])
+					keyIndex++
+					if keyIndex == len(keys) {
+						keyIndex = 0
+					}
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkCacheShardedSetExpire covers the TTL write path, which must not
+// serialize on the cache-wide lifecycle mutex once the cleaner is running.
+func BenchmarkCacheShardedSetExpire(b *testing.B) {
+	keys := numericKeys(1024)
+	for _, shards := range []int{1, 8, 64} {
+		shards := shards
+		b.Run(fmt.Sprintf("Shards%d", shards), func(b *testing.B) {
+			m := WithOptions[int](Options{Capacity: 4096, EnableExpired: true, Shards: shards})
+			defer m.Close()
+			for i, key := range keys {
+				m.Set(key, i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			var worker int64
+			b.RunParallel(func(pb *testing.PB) {
+				w := int(atomic.AddInt64(&worker, 1) - 1)
+				keyIndex := (w * 997) % len(keys)
+				i := 0
+				for pb.Next() {
+					m.SetExpire(keys[keyIndex], i, 3600)
+					i++
+					keyIndex++
+					if keyIndex == len(keys) {
+						keyIndex = 0
+					}
+				}
+			})
+		})
 	}
 }

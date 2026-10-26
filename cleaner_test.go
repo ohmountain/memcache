@@ -186,7 +186,7 @@ func TestCleanerBatchLimit(t *testing.T) {
 	now := clock.Now()
 
 	for batch, want := range []int{defaultCleanupBatchSize, defaultCleanupBatchSize, expired - 2*defaultCleanupBatchSize, 0} {
-		got := m.state.purgeExpiredBatchLocked(now, defaultCleanupBatchSize)
+		got := m.state.purgeExpiredBatch(now, defaultCleanupBatchSize)
 		if got != want {
 			t.Fatalf("batch %d removed %d entries, want %d", batch, got, want)
 		}
@@ -212,12 +212,15 @@ func TestCleanerEmptyHeapSleeps(t *testing.T) {
 	m := newMemcacheWithClock[int](4, true, clock, true)
 	defer m.Close()
 
-	// The worker observes the world once when it starts, then sleeps. The
-	// signal is the schedule; the guard only catches a hung start.
-	select {
-	case <-clock.nowSignal:
-	case <-time.After(2 * time.Second):
-		t.Fatal("worker never sampled the clock")
+	// The constructor samples the clock once for the monotonic base, and the
+	// worker observes the world once when it starts, then sleeps. Wait for both
+	// observations so the idle window below cannot count startup work.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-clock.nowSignal:
+		case <-time.After(2 * time.Second):
+			t.Fatal("worker never sampled the clock")
+		}
 	}
 	calls := clock.nowCallCount()
 	for i := 0; i < 10; i++ {
@@ -284,11 +287,8 @@ func TestCleanerDeadlineChanges(t *testing.T) {
 	// A batch that empties the heap ends with a stop on a consumed timer, which
 	// emits no seam call; wait on the resulting state instead.
 	waitCondition(t, "due entry reclaimed", func() bool {
-		m.state.mu.Lock()
-		defer m.state.mu.Unlock()
 		// "b" stayed live without a TTL; only the due "c" may disappear.
-		_, hasC := m.state.holder["c"]
-		return !hasC && m.state.holder["b"] != nil
+		return !m.state.hasKey("c") && m.state.hasKey("b")
 	})
 }
 

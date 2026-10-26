@@ -262,13 +262,13 @@ func TestForegroundExpiryLiveVictimAndRenewal(t *testing.T) {
 		m, clock := clockCache(t, 2)
 		m.SetExpire("k", 1, 1)
 		m.SetExpire("k", 2, 3600)
-		if len(m.state.expiry) != 1 {
-			t.Fatalf("renewal left %d expiry records", len(m.state.expiry))
+		if m.state.expiryLen() != 1 {
+			t.Fatalf("renewal left %d expiry records", m.state.expiryLen())
 		}
 		clock.Advance(time.Second) // past the original deadline
 		requireValue(t, m, "k", 2)
 		m.Set("k", 3)
-		if len(m.state.expiry) != 0 {
+		if m.state.expiryLen() != 0 {
 			t.Fatal("plain Set did not cancel the TTL record")
 		}
 		clock.Advance(time.Hour)

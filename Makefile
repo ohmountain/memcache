@@ -5,7 +5,7 @@ FUZZWORKERS ?= 4
 PERFSUITE ?= full
 PERFROLE ?= original
 
-.PHONY: check fmt-check lint lint-fix vet test race coverage fuzz bench bench-full bench-expiry perf-quick perf-baseline perf-compare
+.PHONY: check fmt-check lint lint-fix vet test race coverage fuzz bench bench-full bench-expiry bench-sharded perf-quick perf-baseline perf-compare
 
 check: fmt-check lint vet test race
 
@@ -47,6 +47,10 @@ bench-full:
 # adaptive b.N loop would refill 100K/1M caches, so it requires -benchtime=1x.
 bench-expiry:
 	$(GO) test -run='^$$' -bench='^BenchmarkCacheExpiry$$' -benchmem -benchtime=1x -count=10 -timeout=10m ./... -args -cache-perf-full=true
+
+# bench-sharded compares one exact LRU with the opt-in sharded read path.
+bench-sharded:
+	$(GO) test -run='^$$' -bench='^BenchmarkCacheSharded$$' -benchmem -benchtime=200ms -count=1 -cpu=1,2,4,8,24 ./...
 
 # perf-quick measures the working tree with a short latency-only matrix.
 perf-quick:

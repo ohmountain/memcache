@@ -234,3 +234,22 @@ two halves and comparing them with benchstat before believing any delta.
   measurement; the harness's 10ms full-snapshot monitor reads 2.30–2.42× and is
   documented as resolution-limited. Every measured gate passes; the
   Linux/Windows matrix was not run, and that is the remaining acceptance item.
+- `2026-10-26-optimization-opportunities.md` — a measured opportunity audit
+  rather than an acceptance report. It profiles single-thread costs (lazy clock
+  reads, intrusive LRU nodes, int64 deadlines), negative parallel scaling on a
+  24-thread host, sharding tradeoffs, the cost of recency writes on the read
+  path, `Size()` purge stalls, and idle TTL-instance overhead. Numbers come from
+  an uncommitted `.perf-lab/` prototype and are scale evidence for a roadmap,
+  not a Stage C verdict.
+- `2026-10-26-optimization-implementation.md` — what was actually implemented
+  from that audit, with before/after numbers (lazy clock, intrusive nodes with
+  embedded links, int64 deadlines, bounded `Size`, opt-in sharding, `Peek`/`Len`/`Stats`,
+  lazy cleaner) and the items deliberately left for a later policy/measurement
+  stage. Its §2.1 records which original acceptance gates were met, missed
+  (idle memory, high-core sharding), or not measured; footprint now passes at
+  1K/100K under the audit's cache-only methodology, with the key-inclusive
+  variant documented separately.
+- `2026-10-26-embed-link-prototype.md` — controlled A/B of embedding the LRU
+  links in `node` instead of a separate `lruLink`: cache-only footprint,
+  key-inclusive footprint, single-thread paths, and 8/24-thread `Lookup`.
+  Its result was adopted: the production layout now uses the embedded node.
