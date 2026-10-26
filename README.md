@@ -76,6 +76,14 @@ func main() {
   only reads, so disabling them raises multicore read throughput (about 15% at
   24 threads with 64 shards); `Stats()` then reports only `Capacity` and
   `Entries`. Counters stay on by default.
+- `Options.ApproximateTTLReads` speeds up reads of entries with a TTL. By
+  default every such read checks the clock, so an expired entry misses
+  immediately. With the option on, reads compare the deadline against the
+  shard's last observed clock sample instead: about 57% faster single-thread
+  reads (measured 39 → 16 ns), at the cost of serving an entry as a hit for up
+  to one observation window past its deadline. Every TTL write, every cleaner
+  round, and `Size()` publish fresh samples, so write-active shards observe
+  expiry within one operation.
 - The background cleaner starts on the first real TTL write, so a TTL-enabled
   cache that never stores a TTL holds no worker goroutine and none of its
   channels. An empty expiry heap has no timer at all.

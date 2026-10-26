@@ -657,7 +657,7 @@ func TestMassRemovalBoundsFreelist(t *testing.T) {
 
 func TestMassExpiryReleasesHeapBacking(t *testing.T) {
 	clock := &testClock{now: modelEpoch}
-	m := newMemcacheWithClockShards[int](4096, true, systemClock{now: clock.Now}, false, 1, false, true)
+	m := newMemcacheWithClockShards[int](4096, true, systemClock{now: clock.Now}, false, 1, false, true, false)
 	defer m.Close()
 	for i := 0; i < 4096; i++ {
 		m.SetExpire(workloadKey(i), i, 1)

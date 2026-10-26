@@ -30,12 +30,24 @@ func numericKeys(n int) []string {
 
 func BenchmarkCache(b *testing.B) {
 	keys := numericKeys(1024)
-	for _, operation := range []string{"Lookup", "Peek", "Get", "Set", "RenewTTL"} {
+	for _, operation := range []string{"Lookup", "Peek", "Get", "Set", "RenewTTL", "TTLHit", "TTLHitApprox"} {
 		b.Run(operation, func(b *testing.B) {
-			m := WithLRU[int](1024, operation == "RenewTTL")
+			ttl := operation == "RenewTTL" || operation == "TTLHit" || operation == "TTLHitApprox"
+			var m *Memcache[int]
+			if operation == "TTLHitApprox" {
+				m = WithOptions[int](Options{Capacity: 1024, EnableExpired: true, ApproximateTTLReads: true})
+			} else {
+				m = WithLRU[int](1024, ttl)
+			}
 			defer m.Close()
-			for i, key := range keys {
-				m.Set(key, i)
+			if operation == "TTLHit" || operation == "TTLHitApprox" {
+				for i, key := range keys {
+					m.SetExpire(key, i, 3600)
+				}
+			} else {
+				for i, key := range keys {
+					m.Set(key, i)
+				}
 			}
 			b.ReportAllocs()
 			b.ResetTimer()
@@ -70,6 +82,10 @@ func BenchmarkCache(b *testing.B) {
 			case "RenewTTL":
 				for i := 0; i < b.N; i++ {
 					m.SetExpire(nextKey(), i, 60)
+				}
+			case "TTLHit", "TTLHitApprox":
+				for i := 0; i < b.N; i++ {
+					m.Lookup(nextKey())
 				}
 			}
 			b.StopTimer()

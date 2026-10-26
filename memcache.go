@@ -35,6 +35,16 @@ type Options struct {
 	// Peek otherwise never dirties, so disabling them raises multicore read
 	// throughput; do it when the counters are not exported.
 	DisableStats bool
+	// ApproximateTTLReads trades deadline exactness for read speed. When it
+	// is false (the default), every Lookup and Peek of an entry with a TTL
+	// reads the clock and an already-expired entry misses immediately. When
+	// it is true, reads compare the deadline against the shard's last
+	// observed clock sample instead, skipping that clock read; an entry that
+	// expired after the last observation is therefore served as a hit for up
+	// to one observation window. Every TTL write, every cleaner round, and
+	// Size publish fresh samples, so in write-active or cleaner-active
+	// shards the window stays bounded by that activity.
+	ApproximateTTLReads bool
 }
 
 // Stats is a point-in-time snapshot of cache counters. Entries is physical
@@ -91,7 +101,7 @@ func newMemcache[T CacheAble](capacity uint, enableExpired bool, now func() time
 }
 
 func newMemcacheConfigured[T CacheAble](opts Options, clock cacheClock, mode cleanerMode) *Memcache[T] {
-	m := newMemcacheWithClockShards[T](opts.Capacity, opts.EnableExpired, clock, mode == cleanerEager, opts.Shards, opts.Preallocate, !opts.DisableStats)
+	m := newMemcacheWithClockShards[T](opts.Capacity, opts.EnableExpired, clock, mode == cleanerEager, opts.Shards, opts.Preallocate, !opts.DisableStats, opts.ApproximateTTLReads)
 	m.state.autoStart = mode == cleanerLazy
 	return m
 }
@@ -99,11 +109,11 @@ func newMemcacheConfigured[T CacheAble](opts Options, clock cacheClock, mode cle
 // newMemcacheWithClock is the single-shard test seam: the injected clock
 // supplies both deadline reads and cleaner scheduling.
 func newMemcacheWithClock[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool) *Memcache[T] {
-	return newMemcacheWithClockShards[T](capacity, enableExpired, clock, startCleaner, 1, false, true)
+	return newMemcacheWithClockShards[T](capacity, enableExpired, clock, startCleaner, 1, false, true, false)
 }
 
-func newMemcacheWithClockShards[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool, shards int, preallocate bool, collectStats bool) *Memcache[T] {
-	s := newCacheState[T](capacity, enableExpired, clock, shards, preallocate, collectStats)
+func newMemcacheWithClockShards[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool, shards int, preallocate bool, collectStats bool, approxReads bool) *Memcache[T] {
+	s := newCacheState[T](capacity, enableExpired, clock, shards, preallocate, collectStats, approxReads)
 	m := &Memcache[T]{state: s}
 	lives.add(s)
 

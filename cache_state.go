@@ -19,10 +19,9 @@ const (
 )
 
 // shard owns one map/list/heap set and the lock that protects them. The
-// 160-byte body holds the mutex, the map, and the list/heap/free/size fields in
-// the first cache line and a half, and the eight counters from offset 96 to
-// 159 — so hits/misses/sets/deletes share the second line with free and size,
-// while evictions/expirations/peeks/peekHits occupy the third alone.
+// 104-byte body holds the mutex, the map, the list/heap/free/size fields and
+// the approximate-read clock sample in the first cache line and a half, and
+// the eight counters from offset 104 to 167.
 type shard[T CacheAble] struct {
 	mu         sync.Mutex
 	cap        int
@@ -31,6 +30,11 @@ type shard[T CacheAble] struct {
 	heap       expiryHeap[T]
 	free       []*node[T]
 	size       int // mirrors len(m); cached because the full-shard check runs on every insert
+	// nowSample is the newest clock reading any holder of mu has published,
+	// for Options.ApproximateTTLReads. It is a lower bound of the real clock,
+	// so deadline <= nowSample proves expiry while deadline > nowSample only
+	// means "not yet observed expired".
+	nowSample int64
 
 	hits        uint64
 	misses      uint64
@@ -41,7 +45,7 @@ type shard[T CacheAble] struct {
 	peeks       uint64
 	peekHits    uint64
 
-	// This 32-byte pad makes the object 192 bytes, which Go allocates from a
+	// This 24-byte pad keeps the object 192 bytes, which Go allocates from a
 	// class whose minimum alignment is 64 bytes (measured: 192-byte objects
 	// land at 64-byte offsets every time, while 160-byte objects alternate
 	// between offsets 0 and 32). Each shard therefore starts on a cache-line
@@ -50,7 +54,7 @@ type shard[T CacheAble] struct {
 	// next to it can share a line with its hot fields. A 48-byte pad was used
 	// before; 208-byte objects are only 16-byte aligned, so that layout relied
 	// on a phase argument instead of alignment and cost 16 more bytes.
-	_ [32]byte
+	_ [24]byte
 }
 
 // cacheState is retained by the registry and cleaner, independently of the
@@ -67,8 +71,10 @@ type cacheState[T CacheAble] struct {
 	// counts they measurably cap read throughput; Options.DisableStats turns
 	// them off for callers that do not export the counters.
 	collectStats bool
-	clock        cacheClock
-	start        time.Time
+	// approxReads gates the coarse-clock read path (Options.ApproximateTTLReads).
+	approxReads bool
+	clock       cacheClock
+	start       time.Time
 
 	// wake, done, and stopped exist only once a cleaner worker does. They are
 	// created by startWorkerNow under lifeMu before the goroutine starts, so a
@@ -154,13 +160,14 @@ func read8(s string) uint64 {
 		uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56
 }
 
-func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, shards int, preallocate bool, collectStats bool) *cacheState[T] {
+func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, shards int, preallocate bool, collectStats bool, approxReads bool) *cacheState[T] {
 	n := shardCount(capacity, shards)
 	s := &cacheState[T]{
 		mask:          uint64(n - 1),
 		capacity:      capacity,
 		enableExpired: enableExpired,
 		collectStats:  collectStats,
+		approxReads:   approxReads,
 		clock:         clock,
 	}
 	if n > 1 {
@@ -202,6 +209,27 @@ func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheCl
 func (s *cacheState[T]) isClosed() bool { return atomic.LoadUint32(&s.closed) != 0 }
 
 func (s *cacheState[T]) nowNanos() int64 { return int64(s.clock.Since(s.start)) }
+
+// publishNow records a precise clock sample on the shard for approximate
+// reads. The caller must hold sh.mu. A sample older than the stored one is
+// dropped: purgeDueBatch passes a now taken before it waited, and regressing
+// the sample would re-serve entries a newer writer already proved expired.
+func (s *cacheState[T]) publishNow(sh *shard[T], now int64) {
+	if !s.approxReads || now <= sh.nowSample {
+		return
+	}
+	sh.nowSample = now
+}
+
+// deadlineNow is the clock a read uses to test a deadline: the shard's last
+// published sample when approximate reads are on, the precise clock otherwise.
+// The caller must hold sh.mu.
+func (s *cacheState[T]) deadlineNow(sh *shard[T]) int64 {
+	if s.approxReads {
+		return sh.nowSample
+	}
+	return s.nowNanos()
+}
 
 func (s *cacheState[T]) nanosAt(t time.Time) int64 { return int64(t.Sub(s.start)) }
 
@@ -464,6 +492,7 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 	var now int64
 	if touchesHeap {
 		now = s.nowNanos()
+		s.publishNow(sh, now)
 	}
 
 	var deadline int64
@@ -549,7 +578,7 @@ func (s *cacheState[T]) lookup(key string) (T, bool) {
 		var zero T
 		return zero, false
 	}
-	if n.deadline != 0 && n.deadline <= s.nowNanos() {
+	if n.deadline != 0 && n.deadline <= s.deadlineNow(sh) {
 		wasRoot := n.expiryIndex == 0
 		if s.collectStats {
 			sh.expirations++
@@ -602,7 +631,7 @@ func (s *cacheState[T]) peek(key string) (T, bool) {
 		var zero T
 		return zero, false
 	}
-	if n.deadline != 0 && n.deadline <= s.nowNanos() {
+	if n.deadline != 0 && n.deadline <= s.deadlineNow(sh) {
 		sh.mu.Unlock()
 		var zero T
 		return zero, false
@@ -663,6 +692,7 @@ func (s *cacheState[T]) Size() uint {
 				sh.mu.Unlock()
 				return 0
 			}
+			s.publishNow(sh, now)
 			removed := sh.purgeExpiredLocked(now, sizePurgeBatch, s.collectStats)
 			if removed > 0 {
 				purged = true
@@ -750,6 +780,7 @@ func (s *cacheState[T]) purgeDueBatch(now int64, limit int) int {
 			break
 		}
 		sh.mu.Lock()
+		s.publishNow(sh, now)
 		removed += sh.purgeExpiredLocked(now, limit-removed, s.collectStats)
 		sh.mu.Unlock()
 	}
