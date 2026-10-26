@@ -140,11 +140,12 @@ case "$suite" in
       if [ "$case_name" = expiry-burst ]; then
         expiry_args=(-cache-perf-expiry-measure=latency)
       fi
+      # Bash 3.2 treats empty arrays as unset under nounset; guard expansion.
       for rep in 1 2 3; do
         label="perf-${case_name}-rate10000-rep$(printf '%02d' "$rep")"
         run_logged "$label" go test -run '^TestCachePerformance$' -count=1 -timeout=2m . -args \
           -cache-perf-case="$case_name" -cache-perf-rate=10000 -cache-perf-duration=1s \
-          -cache-perf-workers=4 -cache-perf-queue=1024 "${expiry_args[@]}" \
+          -cache-perf-workers=4 -cache-perf-queue=1024 ${expiry_args[@]+"${expiry_args[@]}"} \
           -cache-perf-out="$task_perf_dir/${label}.json"
       done
     done

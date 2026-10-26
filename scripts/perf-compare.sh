@@ -335,10 +335,11 @@ run_perf_case() {
     fi
   fi
   json="$(perf_json "$side" "${label}-rep${rep}")"
+  # Bash 3.2 treats empty arrays as unset under nounset; guard expansion.
   run_logged "${label}-rep${rep}-${side}" "$scratch/$side" \
     go test -run '^TestCachePerformance$' -count=1 -timeout=10m . -args \
     -cache-perf-case="$case_name" -cache-perf-rate="$rate" -cache-perf-duration="$duration" \
-    -cache-perf-workers=4 -cache-perf-queue=1024 "${expiry_args[@]}" -cache-perf-out="$json"
+    -cache-perf-workers=4 -cache-perf-queue=1024 ${expiry_args[@]+"${expiry_args[@]}"} -cache-perf-out="$json"
 }
 
 case "$suite" in

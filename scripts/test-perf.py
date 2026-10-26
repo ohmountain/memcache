@@ -6,11 +6,14 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# macOS ships Bash 3.2; do not let a newer Bash on PATH hide compatibility bugs.
+BASH = "/bin/bash" if sys.platform == "darwin" else "bash"
 
 
 class PerformanceToolsTest(unittest.TestCase):
@@ -94,7 +97,7 @@ class PerformanceToolsTest(unittest.TestCase):
 
     def test_baseline_quick(self):
         output = self.directory / "quick"
-        args = ["bash", "scripts/perf-baseline.sh", "--suite", "quick", "--out", str(output)]
+        args = [BASH, "scripts/perf-baseline.sh", "--suite", "quick", "--out", str(output)]
         self.run_command(args)
         self.check_quick_records(output / "perf", 9)
         manifest = (output / "manifest.txt").read_text()
@@ -124,7 +127,7 @@ class PerformanceToolsTest(unittest.TestCase):
         ], cwd=fixture)
         output = self.directory / "comparison"
         self.run_command([
-            "bash", "scripts/perf-compare.sh", "--suite", "quick",
+            BASH, "scripts/perf-compare.sh", "--suite", "quick",
             "--control", "HEAD", "--candidate", "HEAD", "--harness", "HEAD",
             "--comparison-role", "incremental", "--out", str(output),
         ], cwd=fixture)
