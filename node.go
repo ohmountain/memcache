@@ -10,26 +10,47 @@ type CacheAble any
 // values grow it past one line, so that property is per instantiation. A
 // separate link object cost 8 more bytes per entry in the narrow case.
 type node[T CacheAble] struct {
-	key         string
-	value       T
-	prev        *node[T]
-	next        *node[T]
-	deadline    int64 // monotonic nanoseconds since cacheState.start; 0 = no TTL
-	expiryIndex int   // -1 when the node has no expiration record
+	key      string
+	value    T
+	prev     *node[T]
+	next     *node[T]
+	deadline int64 // monotonic nanoseconds since cacheState.start; 0 = no TTL
+	// heapGen invalidates older expiry records. It is bumped whenever the
+	// deadline changes, the record is cancelled, or the node is released, so
+	// a heap record stays authoritative only while its stored generation
+	// still matches. A plain counter suffices: a released node's generation
+	// only ever moves forward, so a reacquired node cannot resurrect an old
+	// record. Width matches the removed expiryIndex field, keeping narrow
+	// nodes inside one cache line.
+	heapGen uint64
 }
 
-// expiryHeap keeps exactly one record per expiring node. Indices permit updates
-// and cancellation in O(log n), without accumulating stale deadline records.
-// The methods are concrete (not container/heap interface calls) so the hot TTL
-// paths avoid interface dispatch.
-type expiryHeap[T CacheAble] []*node[T]
+// heapRec is one expiry-heap record. The deadline is an immutable snapshot
+// taken at push time: ordering must not observe node.deadline, which mutates
+// on renewal while the old record still orders the heap.
+type heapRec[T CacheAble] struct {
+	n        *node[T]
+	deadline int64
+	gen      uint64
+}
+
+// live reports whether rec is still its node's authoritative record.
+func (rec heapRec[T]) live() bool { return rec.gen == rec.n.heapGen }
+
+// expiryHeap holds at most one live record per expiring node, plus stale
+// records left behind by renewals and cancellations. Stale records are
+// dropped when they surface at the root and swept by compact, so renewal and
+// cancellation never sift and never write nodes. The methods are concrete
+// (not container/heap interface calls) so the hot TTL paths avoid interface
+// dispatch.
+type expiryHeap[T CacheAble] []heapRec[T]
 
 func (h expiryHeap[T]) less(i, j int) bool { return h[i].deadline < h[j].deadline }
 
-func (h expiryHeap[T]) swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].expiryIndex = i
-	h[j].expiryIndex = j
+// swap moves records only; it writes no node, unlike the pre-lazy swap that
+// maintained node indices.
+func (h *expiryHeap[T]) swap(i, j int) {
+	(*h)[i], (*h)[j] = (*h)[j], (*h)[i]
 }
 
 func (h *expiryHeap[T]) up(j int) {
@@ -63,37 +84,38 @@ func (h *expiryHeap[T]) down(i0, n int) bool {
 	return i > i0
 }
 
-func (h *expiryHeap[T]) fix(i int) {
-	if !h.down(i, len(*h)) {
-		h.up(i)
-	}
-}
-
-func (h *expiryHeap[T]) push(n *node[T]) {
-	n.expiryIndex = len(*h)
-	*h = append(*h, n)
+// push appends a record for n at its current generation. Callers bump
+// n.heapGen before pushing so any earlier record of n is stale from here on.
+func (h *expiryHeap[T]) push(n *node[T], deadline int64) {
+	*h = append(*h, heapRec[T]{n: n, deadline: deadline, gen: n.heapGen})
 	h.up(len(*h) - 1)
 }
 
-// removeAt removes the record at i and clears that node's index. The moved
-// last node gets its new index; the removed node always ends at -1 so a later
-// overwrite can never call removeAt again with a stale position.
-func (h *expiryHeap[T]) removeAt(i int) {
+// popRoot removes and returns heap[0]. It never writes a node: the record may
+// be stale, and its node may hold a different live record elsewhere.
+func (h *expiryHeap[T]) popRoot() heapRec[T] {
+	rec := (*h)[0]
 	last := len(*h) - 1
-	removed := (*h)[i]
-	tail := (*h)[last]
-	(*h)[last] = nil
-	if i != last {
-		(*h)[i] = tail
-		tail.expiryIndex = i
-		*h = (*h)[:last]
-		removed.expiryIndex = -1
-		h.fix(i)
-		return
-	}
+	(*h)[0] = (*h)[last]
+	(*h)[last] = heapRec[T]{}
 	*h = (*h)[:last]
-	removed.expiryIndex = -1
+	if last > 0 {
+		h.down(0, len(*h))
+	}
+	return rec
 }
 
-// rebuild restores the heap invariant after a test or an out-of-band deadline
-// rewrite, and refreshes every index.
+// compact drops stale records in place and restores heap order. The write
+// index never passes the read index, so the in-place filter is safe.
+func (h *expiryHeap[T]) compact() {
+	out := (*h)[:0]
+	for _, rec := range *h {
+		if rec.live() {
+			out = append(out, rec)
+		}
+	}
+	for i := len(out)/2 - 1; i >= 0; i-- {
+		out.down(i, len(out))
+	}
+	*h = out
+}

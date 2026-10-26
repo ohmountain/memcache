@@ -103,17 +103,23 @@ func main() {
 ## Implementation and costs
 
 Each shard has one private mutex covering its item map, intrusive LRU, and
-indexed expiration heap. Nodes are pooled per shard; an eviction and reinsert in
-steady state allocates nothing. The LRU links live inside the node; for narrow
-payloads such as the int case below the 56-byte node rounds to the 64-byte size
-class, so a hit's recency write stays on the node's own cache line rather than
-false-sharing with a neighbouring entry. Deadlines are int64 monotonic
-nanoseconds since construction, with one indexed
-heap record per expiring entry; deleting, evicting, renewing, or clearing cannot
-accumulate stale records.
+lazy-deletion expiration heap. Nodes are pooled per shard; an eviction and
+reinsert in steady state allocates nothing. The LRU links live inside the node;
+for narrow payloads such as the int case below the 56-byte node rounds to the
+64-byte size class, so a hit's recency write stays on the node's own cache line
+rather than false-sharing with a neighbouring entry. Deadlines are int64
+monotonic nanoseconds since construction. Expiry records carry their own
+deadline snapshot and a generation counter: renewing pushes a fresh record
+(the old one becomes stale) and cancelling or deleting just bumps the
+generation, so neither sifts and neither writes a node. Stale records are
+dropped when they surface at the heap root and swept by a bounded compaction
+(when the array holds more than twice the entry count), so expiry metadata
+cannot grow without bound.
 
 Lookup and Peek are O(1) for unexpired entries; removing an expired entry costs
-O(log n). A write inserts or cancels a TTL record in O(log n) and is otherwise
+O(1) to cancel plus the amortized stale sweep. A write pushes a TTL record in
+O(log n) worst case — monotone renewals append at the bottom and sift nothing,
+measured 46 ns on the benchmark host — and cancels in O(1); it is otherwise
 O(1) excluding lock acquisition. A new key on a full shard reclaims exactly one
 entry in O(log n). `Len()` and `Cap()` are O(shards) and O(1). `Size()` purges in
 1024-entry chunks per shard: total work is O(k log n) for k expired entries, but

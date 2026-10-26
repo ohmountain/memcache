@@ -226,13 +226,7 @@ func prepareRealExpiryCache(tb testing.TB, expired, live int, spread time.Durati
 		}
 		sh.m[expiryExpiredKey(i)].deadline = int64(deadline.Sub(s.start))
 	}
-	sh.heap = sh.heap[:0]
-	for _, n := range sh.m {
-		if n.deadline != 0 {
-			sh.heap = append(sh.heap, n)
-		}
-	}
-	sh.heap.rebuild()
+	sh.rebuildHeapLocked()
 	sh.mu.Unlock()
 
 	s.startWorkerNow()

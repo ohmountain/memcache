@@ -91,21 +91,21 @@ func TestExpiryMetadataIsBounded(t *testing.T) {
 	for i := 0; i < 10000; i++ {
 		m.SetExpire("k", i, int64(i+1))
 	}
-	if m.state.expiryLen() != 1 {
-		t.Fatalf("renewal left %d expiry records", m.state.expiryLen())
+	if got := m.state.liveExpiryLen(); got != 1 {
+		t.Fatalf("renewal left %d live expiry records, want 1", got)
 	}
 	m.SetExpire("other", 0, 1)
 	m.SetExpire("third", 0, 2)
 	assertInvariants(t, m)
 	m.Delete("other")
 	m.Set("third", 1)
-	if m.state.expiryLen() != 0 {
-		t.Fatal("delete/overwrite retained expiry metadata")
+	if got := m.state.liveExpiryLen(); got != 0 {
+		t.Fatalf("delete/overwrite left %d live expiry records, want 0", got)
 	}
 	m.SetExpire("third", 2, 1)
 	m.Clear()
-	if m.state.expiryLen() != 0 {
-		t.Fatal("Clear retained expiry metadata")
+	if got := m.state.liveExpiryLen(); got != 0 {
+		t.Fatalf("Clear left %d live expiry records, want 0", got)
 	}
 	assertInvariants(t, m)
 }

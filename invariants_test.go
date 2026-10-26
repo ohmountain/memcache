@@ -16,6 +16,32 @@ func assertInvariants(t testing.TB, m *Memcache[int]) {
 			t.Fatalf("inconsistent shard size: map=%d size=%d cap=%d", len(sh.m), sh.size, sh.cap)
 		}
 		total += sh.size
+		// Heap pass first: order by the record's own deadline snapshot, plus
+		// a live-record census used by the list walk below. A record is live
+		// iff its generation still matches its node; stale records may linger
+		// up to the compaction bound.
+		live := make(map[*node[int]]int)
+		for i, rec := range sh.heap {
+			if i > 0 && rec.deadline < sh.heap[(i-1)/2].deadline {
+				sh.mu.Unlock()
+				t.Fatal("expiry heap is out of order")
+			}
+			if rec.gen == rec.n.heapGen {
+				live[rec.n]++
+			}
+		}
+		if len(sh.heap) >= minHeapCompactLen && len(sh.heap) > maxHeapRecordsPerEntry*len(sh.m) {
+			sh.mu.Unlock()
+			t.Fatalf("expiry heap holds %d records for %d entries past the compaction bound", len(sh.heap), len(sh.m))
+		}
+		liveTotal := 0
+		for _, count := range live {
+			liveTotal += count
+		}
+		if liveTotal != sh.heapLive {
+			sh.mu.Unlock()
+			t.Fatalf("heapLive = %d but %d live records present", sh.heapLive, liveTotal)
+		}
 		seen := make(map[string]bool, len(sh.m))
 		var prev *node[int]
 		for n := sh.head; n != nil; n = n.next {
@@ -28,13 +54,9 @@ func assertInvariants(t testing.TB, m *Memcache[int]) {
 				t.Fatal("list and index disagree")
 			}
 			seen[n.key] = true
-			if (n.deadline == 0) != (n.expiryIndex == -1) {
+			if count := live[n]; (n.deadline == 0) != (count == 0) || count > 1 {
 				sh.mu.Unlock()
-				t.Fatal("deadline and heap membership disagree")
-			}
-			if n.expiryIndex >= 0 && (n.expiryIndex >= len(sh.heap) || sh.heap[n.expiryIndex] != n) {
-				sh.mu.Unlock()
-				t.Fatal("incorrect expiry index")
+				t.Fatalf("key %q has %d live records with deadline %d", n.key, count, n.deadline)
 			}
 			prev = n
 		}
@@ -46,19 +68,11 @@ func assertInvariants(t testing.TB, m *Memcache[int]) {
 			sh.mu.Unlock()
 			t.Fatalf("list holds %d entries, map holds %d", len(seen), len(sh.m))
 		}
-		for i, n := range sh.heap {
-			if n.expiryIndex != i || sh.m[n.key] != n || n.deadline == 0 {
+		for n := range live {
+			if !seen[n.key] {
 				sh.mu.Unlock()
-				t.Fatal("stale expiry entry")
+				t.Fatal("live expiry record for a node outside the list")
 			}
-			if i > 0 && n.deadline < sh.heap[(i-1)/2].deadline {
-				sh.mu.Unlock()
-				t.Fatal("expiry heap is out of order")
-			}
-		}
-		if len(sh.heap) > len(sh.m) {
-			sh.mu.Unlock()
-			t.Fatal("expiry metadata exceeds shard size")
 		}
 		sh.mu.Unlock()
 	}

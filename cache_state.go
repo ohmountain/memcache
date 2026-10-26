@@ -16,6 +16,9 @@ const (
 	maxIdleHeapCap       = 1024
 	cleanupBatchDivisor  = 64
 	maxCleanupBatchSize  = 4096
+	// Lazy-heap compaction bounds; see maybeCompactLocked.
+	maxHeapRecordsPerEntry = 2
+	minHeapCompactLen      = 64
 )
 
 // shard owns one map/list/heap set and the lock that protects them. The
@@ -35,6 +38,11 @@ type shard[T CacheAble] struct {
 	// so deadline <= nowSample proves expiry while deadline > nowSample only
 	// means "not yet observed expired".
 	nowSample int64
+	// heapLive counts authoritative records in heap: one per map entry with
+	// a deadline. Stale records are excluded, so heapLive reaching zero is
+	// the live-empty signal that must stop the worker's timer even while
+	// stale records still occupy the array.
+	heapLive int
 
 	hits        uint64
 	misses      uint64
@@ -45,7 +53,7 @@ type shard[T CacheAble] struct {
 	peeks       uint64
 	peekHits    uint64
 
-	// This 24-byte pad keeps the object 192 bytes, which Go allocates from a
+	// This 16-byte pad keeps the object 192 bytes, which Go allocates from a
 	// class whose minimum alignment is 64 bytes (measured: 192-byte objects
 	// land at 64-byte offsets every time, while 160-byte objects alternate
 	// between offsets 0 and 32). Each shard therefore starts on a cache-line
@@ -54,7 +62,7 @@ type shard[T CacheAble] struct {
 	// next to it can share a line with its hot fields. A 48-byte pad was used
 	// before; 208-byte objects are only 16-byte aligned, so that layout relied
 	// on a phase argument instead of alignment and cost 16 more bytes.
-	_ [24]byte
+	_ [16]byte
 }
 
 // cacheState is retained by the registry and cleaner, independently of the
@@ -357,10 +365,9 @@ func (s *shard[T]) acquire(key string, value T) *node[T] {
 		n.key, n.value = key, value
 		n.prev, n.next = nil, nil
 		n.deadline = 0
-		n.expiryIndex = -1
 		return n
 	}
-	return &node[T]{key: key, value: value, expiryIndex: -1}
+	return &node[T]{key: key, value: value}
 }
 
 func (s *shard[T]) release(n *node[T]) {
@@ -369,18 +376,23 @@ func (s *shard[T]) release(n *node[T]) {
 	n.value = zero
 	n.prev, n.next = nil, nil
 	n.deadline = 0
-	n.expiryIndex = -1
+	// The bump kills any record still pointing at n, so reuse through the
+	// freelist can never resurrect it.
+	n.heapGen++
 	if len(s.free) >= maxFreeNodesPerShard {
 		return
 	}
 	s.free = append(s.free, n)
 }
 
-// removeLocked removes one entry from the list, index, and expiry heap.
+// removeLocked removes one entry from the list and index. Its expiry records
+// are cancelled by bumping the generation; the stale records surface at the
+// root later and are dropped, so removal does not sift.
 func (s *shard[T]) removeLocked(n *node[T]) {
-	if n.expiryIndex >= 0 {
-		s.heap.removeAt(n.expiryIndex)
+	if n.deadline != 0 {
+		s.heapLive--
 	}
+	n.heapGen++
 	s.unlink(n)
 	delete(s.m, n.key)
 	s.size--
@@ -390,15 +402,34 @@ func (s *shard[T]) removeLocked(n *node[T]) {
 	}
 }
 
+// maybeCompactLocked bounds stale-record memory: once the heap holds at least
+// minHeapCompactLen records and more than maxHeapRecordsPerEntry per live
+// entry, drop the stale ones. Called from every operation that grows the heap
+// or shrinks the map (not from removeLocked itself, so purge loops stay
+// amortized), which makes the bound an after-operation invariant.
+func (s *shard[T]) maybeCompactLocked() {
+	if len(s.heap) >= minHeapCompactLen && len(s.heap) > maxHeapRecordsPerEntry*len(s.m) {
+		s.heap.compact()
+		s.heapLive = len(s.heap)
+	}
+}
+
 func (s *shard[T]) purgeExpiredLocked(now int64, limit int, collectStats bool) int {
 	removed := 0
 	for removed < limit && len(s.heap) > 0 && s.heap[0].deadline <= now {
+		rec := s.heap.popRoot()
+		if !rec.live() {
+			// A record of a renewed, cancelled, or reused node: discard it
+			// without touching the entry.
+			continue
+		}
 		if collectStats {
 			s.expirations++
 		}
-		s.removeLocked(s.heap[0])
+		s.removeLocked(rec.n)
 		removed++
 	}
+	s.maybeCompactLocked()
 	return removed
 }
 
@@ -422,12 +453,19 @@ func (s *shard[T]) clearLocked() {
 	s.m = nil
 	s.head, s.tail = nil, nil
 	s.heap = nil
+	s.heapLive = 0
 	s.free = nil
 	s.size = 0
 }
 
-// rootDeadline is the earliest deadline in this shard (zero when none).
+// rootDeadline is the earliest live deadline in this shard (zero when none).
+// Stale records at the root are popped on the way: callers hold the shard
+// lock, and letting a stale root survive would arm the timer at a deadline no
+// live entry has, delaying the empty-heap stop.
 func (s *shard[T]) rootDeadline() int64 {
+	for len(s.heap) > 0 && !s.heap[0].live() {
+		s.heap.popRoot()
+	}
 	if len(s.heap) == 0 {
 		return 0
 	}
@@ -527,6 +565,9 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		}
 		sh.removeLocked(n)
 		n, ok = nil, false
+		// The removed node carried the old deadline; the insert below must
+		// compare against zero or an equal-value rewrite would skip its push.
+		oldDeadline = 0
 	}
 
 	if ok {
@@ -545,14 +586,21 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		sh.size++
 	}
 
-	n.deadline = deadline
-	switch {
-	case deadline == 0 && n.expiryIndex >= 0:
-		sh.heap.removeAt(n.expiryIndex)
-	case deadline != 0 && n.expiryIndex >= 0:
-		sh.heap.fix(n.expiryIndex)
-	case deadline != 0:
-		sh.heap.push(n)
+	// A deadline change bumps the generation (cancelling any earlier record)
+	// and pushes one fresh record; an unchanged deadline touches nothing.
+	if deadline != oldDeadline {
+		n.heapGen++
+		n.deadline = deadline
+		if oldDeadline != 0 {
+			sh.heapLive-- // the replaced record just went stale
+		}
+		if deadline != 0 {
+			sh.heap.push(n, deadline)
+			sh.heapLive++
+			sh.maybeCompactLocked()
+		}
+	} else {
+		n.deadline = deadline
 	}
 	if s.collectStats {
 		sh.sets++
@@ -586,15 +634,17 @@ func (s *cacheState[T]) lookup(key string) (T, bool) {
 		return zero, false
 	}
 	if n.deadline != 0 && n.deadline <= s.deadlineNow(sh) {
-		wasRoot := n.expiryIndex == 0
 		if s.collectStats {
 			sh.expirations++
 		}
 		sh.removeLocked(n)
+		sh.maybeCompactLocked()
 		// Removing an entry can only raise the shard root or empty the heap,
-		// and an armed timer already covers a root that moved later. Only an
-		// emptied heap needs the worker to stop its timer.
-		changed := wasRoot && len(sh.heap) == 0
+		// and an armed timer already covers a root that moved later. Only a
+		// live-empty heap needs the worker to stop its timer; stale records
+		// left behind keep the array non-empty, and the worker drops them
+		// when its timer next fires.
+		changed := sh.heapLive == 0
 		if s.collectStats {
 			sh.misses++
 		}
@@ -663,12 +713,14 @@ func (s *cacheState[T]) delete(key string) {
 	}
 	changed := false
 	if n, ok := sh.m[key]; ok {
-		wasRoot := n.expiryIndex == 0
 		if s.collectStats {
 			sh.deletes++
 		}
 		sh.removeLocked(n)
-		changed = wasRoot && len(sh.heap) == 0
+		sh.maybeCompactLocked()
+		// Same contract as the expired-read removal: a live-empty heap needs
+		// the worker's timer stopped, stale records notwithstanding.
+		changed = sh.heapLive == 0
 	}
 	sh.mu.Unlock()
 	if changed {

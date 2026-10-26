@@ -44,11 +44,19 @@ func snapshotCache(m *Memcache[int]) cacheSnapshot {
 			if n.deadline != 0 {
 				deadline = s.start.Add(time.Duration(n.deadline))
 			}
-			snap.Items[n.key] = snapshotItem{Value: n.value, Deadline: deadline, ExpiryIndex: n.expiryIndex}
+			snap.Items[n.key] = snapshotItem{Value: n.value, Deadline: deadline, ExpiryIndex: -1}
 			snap.Order = append(snap.Order, n.key)
 		}
-		for _, n := range sh.heap {
-			snap.Heap = append(snap.Heap, n.key)
+		// The heap view lists live records in array order; each entry's
+		// ExpiryIndex points into this view. Stale records are invisible.
+		for _, rec := range sh.heap {
+			if !rec.live() {
+				continue
+			}
+			item := snap.Items[rec.n.key]
+			item.ExpiryIndex = len(snap.Heap)
+			snap.Items[rec.n.key] = item
+			snap.Heap = append(snap.Heap, rec.n.key)
 		}
 		sh.mu.Unlock()
 	}
