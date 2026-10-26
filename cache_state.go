@@ -19,6 +19,9 @@ const (
 	// Lazy-heap compaction bounds; see maybeCompactLocked.
 	maxHeapRecordsPerEntry = 2
 	minHeapCompactLen      = 64
+	// clearRefillHintCap bounds the map-rebuild hint a Clear records, so a
+	// sparse refill never pre-sizes a shard map beyond this.
+	clearRefillHintCap = 4096
 )
 
 // shard owns one map/list/heap set and the lock that protects them. The
@@ -48,6 +51,12 @@ type shard[T CacheAble] struct {
 	// the live-empty signal that must stop the worker's timer even while
 	// stale records still occupy the array.
 	heapLive int
+	// refillHint is the entry count at the last Clear, capped at the shard's
+	// capacity and clearRefillHintCap; the first insert after a Clear uses it
+	// to pre-size the recreated map so a refill skips most of the growth
+	// ladder. int32 plus the alignment gap before the counters keeps the
+	// object at 192 bytes.
+	refillHint int32
 
 	hits        uint64
 	misses      uint64
@@ -58,7 +67,7 @@ type shard[T CacheAble] struct {
 	peeks       uint64
 	peekHits    uint64
 
-	// This 16-byte pad keeps the object 192 bytes, which Go allocates from a
+	// This 8-byte pad keeps the object 192 bytes, which Go allocates from a
 	// class whose minimum alignment is 64 bytes (measured: 192-byte objects
 	// land at 64-byte offsets every time, while 160-byte objects alternate
 	// between offsets 0 and 32). Each shard therefore starts on a cache-line
@@ -67,7 +76,7 @@ type shard[T CacheAble] struct {
 	// next to it can share a line with its hot fields. A 48-byte pad was used
 	// before; 208-byte objects are only 16-byte aligned, so that layout relied
 	// on a phase argument instead of alignment and cost 16 more bytes.
-	_ [16]byte
+	_ [8]byte
 }
 
 // cacheState is retained by the registry and cleaner, independently of the
@@ -460,7 +469,27 @@ func (s *shard[T]) clearLocked() {
 	s.heap = nil
 	s.heapLive = 0
 	s.free = nil
+	cleared := int(atomic.LoadUint32(&s.size))
 	atomic.StoreUint32(&s.size, 0)
+	s.refillHint = int32(refillHintFor(cleared, s.cap))
+}
+
+// refillHintFor is the map rebuild size recorded by a Clear: the size the
+// shard actually held (never more than its capacity, never more than
+// clearRefillHintCap), so repeated Clear-and-refill cycles skip most of the
+// map growth ladder while a Clear followed by sparse use does not pin a
+// large pre-allocation.
+func refillHintFor(size, cap int) int {
+	if size <= 0 {
+		return 0
+	}
+	if size > cap {
+		size = cap
+	}
+	if size > clearRefillHintCap {
+		size = clearRefillHintCap
+	}
+	return size
 }
 
 // setSizeLocked records the shard's entry count under mu. Every access to
@@ -592,7 +621,7 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		n = sh.acquire(key, value)
 		sh.pushFront(n)
 		if sh.m == nil {
-			sh.m = make(map[string]*node[T])
+			sh.m = make(map[string]*node[T], int(sh.refillHint))
 		}
 		sh.m[key] = n
 		sh.setSizeLocked(int(atomic.LoadUint32(&sh.size)) + 1)

@@ -611,7 +611,7 @@ func TestIntrusiveLayout(t *testing.T) {
 	// 192 is a size class with 64-byte minimum alignment, so every shard
 	// starts on a cache-line boundary and owns exactly three lines.
 	if got := unsafe.Sizeof(shard[uint64]{}); got != 192 {
-		t.Fatalf("shard[uint64] = %d bytes, want 192 (160-byte body + 32-byte pad)", got)
+		t.Fatalf("shard[uint64] = %d bytes, want 192 (three whole cache lines)", got)
 	}
 	// The alignment, not the size, is what the padding buys. Pin it directly:
 	// a size-only check would still pass if the body/pad split changed in a way
