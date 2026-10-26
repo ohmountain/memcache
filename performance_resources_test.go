@@ -250,7 +250,8 @@ func runLifecycleScenario(t *testing.T, base perfRecord, rounds, perRound int) p
 		// the compiler may already consider retained dead and GC could
 		// collect the payloads before the "held" numbers are read.
 		runtime.KeepAlive(retained)
-		retained = nil
+		// The last use above ends the payloads' liveness; the next GC can
+		// collect them before the after-release sample.
 		allocFreed, objectsFreed := readHeapStats()
 		t.Logf("payload boundary: held alloc=%d objects=%d; released alloc=%d objects=%d", allocHeld, objectsHeld, allocFreed, objectsFreed)
 		base.ResourcesHeld = map[string]uint64{

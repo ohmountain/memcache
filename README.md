@@ -98,12 +98,33 @@ reads, and TTL removal on ordinary Set are defined above.
 
 ## Development
 
+Install golangci-lint v2.15.0 (the version pinned in CI) using the
+[official installer](https://golangci-lint.run/docs/welcome/install/local/).
+For Linux/macOS:
+
 ```sh
-make check       # formatting, vet, unit/integration tests, shuffled race tests
+curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.15.0/install.sh \
+  | sh -s -- -b "$(go env GOPATH)/bin" v2.15.0
+export PATH="$(go env GOPATH)/bin:$PATH"
+golangci-lint version
+```
+
+Run `make check` after every code change and before submitting it:
+
+```sh
+make check       # formatting, lint, vet, unit/integration tests, shuffled race tests
+make lint        # lint all packages, including tests
+make lint-fix    # apply supported lint/formatting fixes; review the diff afterward
 make coverage    # report statement coverage; writes ignored coverage.out
 make fuzz        # 15-second reference-model fuzz run, four workers
 make bench       # bounded benchmark and allocation report
 ```
+
+Lint uses `.golangci.yml`: the standard linters plus durationcheck, errorlint,
+and nolintlint, with gofmt/goimports formatting checks. GitHub Actions checks
+the full codebase on every push and pull request. Run lint on a modern Go
+toolchain supported by golangci-lint; the library still supports Go 1.18.
+Use `GOLANGCI_LINT=/path/to/golangci-lint make lint` for a custom binary path.
 
 The tests use only Go's testing tools. See [docs/testing.md](docs/testing.md) for
 coverage, reproducibility, platform behavior, and direct Go commands.

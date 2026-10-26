@@ -169,7 +169,7 @@ func writePerfRecord(path string, record perfRecord) error {
 		return err
 	}
 	if _, err := file.Write(append(data, '\n')); err != nil {
-		file.Close()
+		_ = file.Close() // Preserve the write error if closing also fails.
 		return err
 	}
 	return file.Close()

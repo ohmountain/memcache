@@ -50,7 +50,14 @@ acts on other registered caches in the same process.
 
 ## Commands
 
+Run `make check` after each code change. It includes `make lint` using
+golangci-lint v2.15.0 and the repository's `.golangci.yml`, including test files.
+See the [development setup](../README.md#development) for installation.
+`make lint-fix` applies supported fixes; review the changes and rerun the full
+check afterward. Lint failures must be resolved before submitting changes.
+
 ```sh
+golangci-lint run --config=.golangci.yml ./...
 go vet ./...
 go test -count=1 -timeout=60s ./...
 go test -race -shuffle=on -count=3 -timeout=120s ./...
@@ -121,7 +128,9 @@ report observations rather than imposing machine-dependent latency thresholds.
 Statement coverage measures executed code; race/model/behavior checks are still
 required and cannot be replaced by a coverage percentage.
 
-CI runs vet, tests, and shuffled race checks on Go 1.18/Linux and stable Go on
+CI runs a separate golangci-lint job on stable Go/Linux for every push and pull
+request, with the tool version pinned to v2.15.0. CI also runs vet, tests, and
+shuffled race checks on Go 1.18/Linux and stable Go on
 Linux, macOS, and Windows. Every matrix entry therefore runs the real
 cleaner/timer and lifecycle tests; the Go 1.18 entry is the old-timer-semantics
 gate. Stable Linux also checks formatting, coverage, and fuzzing. Actions are

@@ -1,15 +1,22 @@
 GO ?= go
+GOLANGCI_LINT ?= golangci-lint
 FUZZTIME ?= 15s
 FUZZWORKERS ?= 4
 PERFSUITE ?= full
 PERFROLE ?= original
 
-.PHONY: check fmt-check vet test race coverage fuzz bench bench-full bench-expiry perf-quick perf-baseline perf-compare
+.PHONY: check fmt-check lint lint-fix vet test race coverage fuzz bench bench-full bench-expiry perf-quick perf-baseline perf-compare
 
-check: fmt-check vet test race
+check: fmt-check lint vet test race
 
 fmt-check:
 	@test -z "$$(gofmt -l *.go)" || { gofmt -l *.go; exit 1; }
+
+lint:
+	$(GOLANGCI_LINT) run --config=.golangci.yml ./...
+
+lint-fix:
+	$(GOLANGCI_LINT) run --config=.golangci.yml --fix ./...
 
 vet:
 	$(GO) vet ./...
