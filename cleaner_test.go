@@ -230,6 +230,19 @@ func TestCleanerEmptyHeapSleeps(t *testing.T) {
 		t.Fatalf("empty-heap worker created %d timers, want 0", got)
 	}
 
+	// A periodic wake would have to use real time: advancing the injected
+	// clock cannot drive one. Observe for more than three removed-ticker
+	// periods, so a real 100ms poller must read the clock inside this window.
+	// Unlike the fake-clock waits elsewhere, real time is the observation
+	// medium here; the counters, not the sleep, are the assertion.
+	time.Sleep(350 * time.Millisecond)
+	if got := clock.nowCallCount(); got != calls {
+		t.Fatalf("empty-heap worker made %d clock calls during a 350ms idle window, want 0", got-calls)
+	}
+	if got := fake.newTimerCount(); got != 0 {
+		t.Fatalf("empty-heap worker created %d timers during the idle window, want 0", got)
+	}
+
 	ch := seamSignals(fake)
 	m.SetExpire("k", 1, 3600)
 	waitArmedDelay(t, ch, fake, 3600*time.Second)
@@ -448,6 +461,11 @@ func TestCleanerCloseBetweenBatches(t *testing.T) {
 	case <-m.state.stopped:
 	case <-time.After(2 * time.Second):
 		t.Fatal("worker did not exit after Close")
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("repeated Close did not return")
 	}
 	if snap := snapshotCache(m); len(snap.Items) != 0 {
 		t.Fatalf("closed cache retained %d entries", len(snap.Items))
