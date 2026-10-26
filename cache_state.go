@@ -25,9 +25,9 @@ const (
 )
 
 // shard owns one map/list/heap set and the lock that protects them. The
-// 104-byte body holds the mutex, the map, the list/heap/free/size fields and
-// the approximate-read clock sample in the first cache line and a half, and
-// the eight counters from offset 104 to 167.
+// body through the clock and refill fields ends at offset 116 — still under
+// the two-cache-line mark — and the eight counters run from offset 120
+// to 183.
 type shard[T CacheAble] struct {
 	mu         sync.Mutex
 	cap        int

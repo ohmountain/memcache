@@ -180,7 +180,7 @@ func (m *Memcache[T]) Get(key string) *T {
 // GetInto writes a shallow value copy into dst on a hit and reports whether
 // the key was present and live; on a miss dst is left untouched. It has the
 // same recency and expiry semantics as Lookup and, unlike Get, allocates
-// nothing.
+// nothing. A nil dst panics on a hit.
 func (m *Memcache[T]) GetInto(key string, dst *T) bool {
 	value, ok := m.state.lookup(key)
 	runtime.KeepAlive(m)
@@ -226,7 +226,10 @@ func (m *Memcache[T]) Size() uint {
 }
 
 // Len returns the physical entry count without purging expired entries. It
-// never reads the clock and is suitable for monitoring.
+// never reads the clock and is suitable for monitoring. It is lock-free: it
+// reads each shard's published size atomically without taking a shard lock,
+// so a concurrent Clear or Close may briefly leave stale counts in the sum;
+// a quiescent read is exact.
 func (m *Memcache[T]) Len() uint {
 	n := m.state.Len()
 	runtime.KeepAlive(m)

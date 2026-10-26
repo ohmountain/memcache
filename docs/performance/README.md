@@ -289,3 +289,13 @@ two halves and comparing them with benchstat before believing any delta.
   `+8 B` rather than `+16 B`, `InsertEvict` `+5.3%` in the independent-process
   set, a stale `ab.sh` output that reproduces a pre-revert state) are corrected
   in place.
+- `2026-10-26-round4-audit.md` — the independent audit of round 4
+  (`c9d50ea..f942819`): an adversarial trace of the lazy-deletion heap, the
+  wake contract, the atomic shard size, and the approximate TTL clock found no
+  Critical defect; gates, Go 1.18 compilation, layout offsets, and the headline
+  benchmark (−57.6% TTL read) were independently reproduced. It found the plan-
+  mandated public `Len` concurrency-contract doc was never written (the internal
+  comment had it, the godoc users read did not), a stale layout-comment
+  regression, and an undocumented-but-correct fix of two arithmetically
+  impossible plan test-table rows; all are fixed here and the deviations are
+  now recorded.
