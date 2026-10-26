@@ -177,6 +177,20 @@ func (m *Memcache[T]) Get(key string) *T {
 	return &value
 }
 
+// GetInto writes a shallow value copy into dst on a hit and reports whether
+// the key was present and live; on a miss dst is left untouched. It has the
+// same recency and expiry semantics as Lookup and, unlike Get, allocates
+// nothing.
+func (m *Memcache[T]) GetInto(key string, dst *T) bool {
+	value, ok := m.state.lookup(key)
+	runtime.KeepAlive(m)
+	if !ok {
+		return false
+	}
+	*dst = value
+	return true
+}
+
 // Lookup returns a shallow value copy and whether the key is present and live.
 // Successful reads refresh the LRU order.
 func (m *Memcache[T]) Lookup(key string) (T, bool) {

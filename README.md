@@ -34,7 +34,10 @@ func main() {
   stores nothing. Successful `Lookup` reads and writes refresh LRU order; `Peek` does not.
 - `Get(key) *T` returns nil for a miss, or a pointer to a **shallow value copy**.
   `Lookup(key) (T, bool)` distinguishes misses from stored zero/nil values without
-  allocating a result pointer. `Peek(key) (T, bool)` returns the same shallow copy
+  allocating a result pointer. `GetInto(key, dst *T) bool` is Lookup with the
+  copy written into a caller-provided destination, for hot paths that want
+  neither the branch on zero values nor Get's one allocation. `Peek(key) (T, bool)`
+  returns the same shallow copy
   **without refreshing recency**, which makes it the read path for multi-core
   workloads that can accept approximate LRU. Updating a returned scalar cannot
   update the cache.
