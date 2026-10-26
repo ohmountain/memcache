@@ -15,9 +15,15 @@ type MonitorAble interface {
 // monitor is a sync.Map-backed registry with an atomic count. Create/close do
 // not serialize on one mutex, which matters when an application churns many
 // short-lived caches.
+//
+// count must stay the first field. 64-bit atomic operations require 8-byte
+// alignment on 386, arm, and 32-bit mips, and only the first word of a global
+// or of an allocated struct is guaranteed to be aligned. With sync.Map first,
+// count lands at offset 20 on 386 (sync.Map is 20 bytes there) and every
+// registration panics with "unaligned 64-bit atomic operation".
 type monitor struct {
-	instances sync.Map
 	count     int64
+	instances sync.Map
 }
 
 func (m *monitor) add(cache MonitorAble) {
