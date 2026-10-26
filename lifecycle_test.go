@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -25,9 +26,7 @@ func TestCloseUnregistersAndRejectsWrites(t *testing.T) {
 		if Lives() != before {
 			t.Fatal("closed cache still registered")
 		}
-		select {
-		case <-m.state.stopped:
-		default:
+		if cleanerRunning(m) {
 			t.Fatal("Close returned before cleaner stopped")
 		}
 		m.Set("a", 1)
@@ -66,16 +65,22 @@ func TestAbandonedHandleCanBeCollected(t *testing.T) {
 		t.Cleanup(state.close)
 		waitUntil(t, "abandoned handle collection", func() bool {
 			runtime.GC()
-			select {
-			case <-state.done:
+			// done is nil when no worker was ever started (the cache never
+			// held a TTL), in which case unregistration alone proves the
+			// finalizer ran.
+			if state.done != nil {
+				select {
+				case <-state.done:
+				default:
+					return false
+				}
 				select {
 				case <-state.stopped:
-					return Lives() == before
 				default:
+					return false
 				}
-			default:
 			}
-			return false
+			return Lives() == before
 		})
 	}
 }
@@ -95,9 +100,65 @@ func waitUntil(t *testing.T, description string, condition func() bool) {
 	}
 }
 
+// TestConcurrentCloseWaitsForTeardown pins that a Close which observes a
+// cache already being closed waits for the first Close to finish emptying and
+// unregistering it, instead of returning as soon as the cleaner exits.
+//
+// The window is one shard clear per Close and whether a given closer lands in
+// it depends on scheduling, so this is a probabilistic detector: at 50
+// iterations it missed the pre-fix bug in 7 of 40 runs across two batches. 400
+// iterations cost about 0.3s and caught it in 10 of 10, so the count stays
+// large on purpose — shrinking it makes the test quietly stop guarding
+// anything.
+//
+// Stats is the observable channel: Len and Size both short-circuit to 0 once
+// closed, so asserting on either would make this vacuous.
+func TestConcurrentCloseWaitsForTeardown(t *testing.T) {
+	const (
+		iterations = 400
+		closers    = 4
+		entries    = 4096
+	)
+	for iteration := 0; iteration < iterations; iteration++ {
+		before := Lives()
+		m := WithOptions[int](Options{Capacity: entries, Shards: 64, EnableExpired: true})
+		for i := 0; i < entries; i++ {
+			m.SetExpireDuration(workloadKey(i), i, time.Hour)
+		}
+
+		var wg sync.WaitGroup
+		failures := make(chan string, closers)
+		wg.Add(closers)
+		for i := 0; i < closers; i++ {
+			go func() {
+				defer wg.Done()
+				m.Close()
+				if got := m.Stats().Entries; got != 0 {
+					failures <- fmt.Sprintf("Close returned with %d entries still present", got)
+					return
+				}
+				if got := Lives(); got != before {
+					failures <- fmt.Sprintf("Close returned while still registered: Lives = %d, want %d", got, before)
+				}
+			}()
+		}
+		wg.Wait()
+		close(failures)
+		for msg := range failures {
+			t.Fatalf("iteration %d: %s", iteration, msg)
+		}
+	}
+}
+
 func abandonHandle(expiry bool) *cacheState[int] {
 	m := WithLRU[int](2, expiry)
-	m.Set("k", 1)
+	if expiry {
+		// Start the cleaner so the finalizer is also exercised on the
+		// join-the-worker path, not only on the no-worker path.
+		m.SetExpire("k", 1, 3600)
+	} else {
+		m.Set("k", 1)
+	}
 	return m.state
 }
 

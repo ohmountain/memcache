@@ -26,6 +26,12 @@ type cacheTimer interface {
 	Reset(time.Duration) bool
 }
 
+// productionClock is the clock shared by every cache built through WithLRU and
+// WithOptions. systemClock has no mutable state, so one interface value serves
+// all of them; boxing a fresh one per cache cost an allocation and 16 bytes for
+// every instance created. Test seams still box their injected clock.
+var productionClock cacheClock = systemClock{now: time.Now, monotonic: true}
+
 // systemClock combines the cache's injected now function with real timers, so
 // deadline decisions and scheduling read the same clock source. monotonic marks
 // a now function that is time.Now itself, which lets Since take time.Since's

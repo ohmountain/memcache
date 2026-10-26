@@ -21,7 +21,7 @@ const defaultCleanupBatchSize = 64
 // the worker act on stale state.
 func (s *cacheState[T]) runCleaner() {
 	var timer cleanerTimer
-	defer s.closeStopped()
+	defer close(s.stopped)
 	defer timer.stop()
 	for {
 		now := s.nowNanos()
@@ -62,7 +62,10 @@ func (s *cacheState[T]) runCleaner() {
 		}
 		removed := s.purgeDueBatch(now, cleanupBatchSize(expiryRecords))
 		if removed == 0 {
-			// A root changed between the read and the lock; re-read it.
+			// A root changed between the read and the lock; re-read it. Yield
+			// first so a root that is repeatedly renewed just past the sample
+			// cannot keep the worker spinning on shard locks.
+			runtime.Gosched()
 			continue
 		}
 		select {

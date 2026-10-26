@@ -273,13 +273,21 @@ func TestCleanerDeadlineChanges(t *testing.T) {
 	m.SetExpire("b", 2, 10)
 	waitArmedDelay(t, ch, fake, 10*time.Second)
 
-	// Extending the earliest entry exposes the next real root.
+	// Extending the earliest entry exposes the next real root only when the
+	// armed timer fires. A root that moves later can never make the timer too
+	// late, so the worker is deliberately not woken for it (see rootNeedsWake);
+	// the timer fires at the older deadline, re-reads the real roots, and
+	// re-arms. The assertion is just as strict, only sequenced after the fire.
 	m.SetExpire("b", 3, 120)
-	waitArmedDelay(t, ch, fake, 30*time.Second)
+	fake.Advance(10 * time.Second)
+	fake.timer(0).fire()
+	waitArmedDelay(t, ch, fake, 20*time.Second) // "a" keeps its 20s remainder
 
-	// Deleting the heap root exposes the next root.
+	// Deleting the heap root is observed the same way.
 	m.Delete("a")
-	waitArmedDelay(t, ch, fake, 120*time.Second)
+	fake.Advance(20 * time.Second)
+	fake.timer(0).fire()
+	waitArmedDelay(t, ch, fake, 90*time.Second) // "b" keeps its 90s remainder
 
 	// Cancelling the last TTL empties the heap and stops the timer.
 	m.Set("b", 4)
@@ -298,6 +306,62 @@ func TestCleanerDeadlineChanges(t *testing.T) {
 		// "b" stayed live without a TTL; only the due "c" may disappear.
 		return !m.state.hasKey("c") && m.state.hasKey("b")
 	})
+}
+
+// TestCleanerShortenedDeadlineRearms covers the one direction of the extends
+// fast path that must NOT stay silent. Renewing a root to a later deadline may
+// skip the wake because the armed timer already points at the earlier one; a
+// root shortened to an earlier deadline may not, or the timer keeps pointing at
+// the original deadline and the entry stays resident until then. Lookups cannot
+// observe that, because they check expiry themselves, so this asserts on the
+// armed delay and then on the physical removal.
+//
+// TestCleanerDeadlineChanges exercises an earlier deadline only through a NEW
+// key, which has no previous deadline and so never takes the extends path. This
+// is the same-key case, where the deadline comparison decides.
+func TestCleanerShortenedDeadlineRearms(t *testing.T) {
+	m, fake, _ := newCleanerFixture(t, 8)
+	ch := seamSignals(fake)
+
+	m.SetExpire("a", 1, 90)
+	waitArmedDelay(t, ch, fake, 90*time.Second)
+
+	// Same key, still the heap root, deadline moved earlier.
+	m.SetExpire("a", 2, 10)
+	waitArmedDelay(t, ch, fake, 10*time.Second)
+
+	// The shortened deadline must be acted on, not merely armed.
+	fake.Advance(10 * time.Second)
+	requireMissing(t, m, "a")
+	assertInvariants(t, m)
+}
+
+// TestRootNeedsWake pins the wake policy the round-3 throughput result depends
+// on. Notifying on every root change is correct — the worker only re-reads the
+// roots — but it keeps the one-slot wake permanently full under sustained
+// renewal, so the worker loops over every shard lock without reclaiming
+// anything. The "later root" and "unchanged" cases are load-bearing for
+// throughput, and the end-to-end cleaner tests can only observe them
+// indirectly, which is why the predicate is pinned here.
+func TestRootNeedsWake(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		before, after int64
+		want          bool
+	}{
+		{"unchanged live root", 100, 100, false},
+		{"both empty", 0, 0, false},
+		{"empty to live", 0, 100, true},
+		{"emptied", 100, 0, true},
+		{"earlier root", 100, 50, true},
+		{"later root", 100, 200, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := rootNeedsWake(tc.before, tc.after); got != tc.want {
+				t.Fatalf("rootNeedsWake(%d, %d) = %v, want %v", tc.before, tc.after, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestCleanerWakeCoalesces(t *testing.T) {
@@ -616,6 +680,9 @@ func TestCleanerLookupOfDueRootRearms(t *testing.T) {
 	waitArmedDelay(t, ch, fake, 10*time.Second)
 	fake.Advance(10 * time.Second) // "a" is due; "b" still has 20s left
 	requireMissing(t, m, "a")
+	// Reclaiming a due root only raises the shard root, so the worker is not
+	// woken: the armed timer fires and re-arms at the next real deadline.
+	fake.timer(0).fire()
 	waitArmedDelay(t, ch, fake, 20*time.Second)
 	assertInvariants(t, m)
 }

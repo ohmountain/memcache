@@ -51,11 +51,22 @@ func TestPerformanceRoundsReleaseOwnedCaches(t *testing.T) {
 	}
 }
 
-// cleanerRunning reports whether a cache's background cleaner has not
-// stopped yet. It is the one place that reads the stopped channel.
+// cleanerRunning reports whether a cache's background cleaner has not stopped
+// yet. It is the one place that reads the stopped channel.
+//
+// A nil stopped means no worker was ever started — the cache never held a TTL
+// — which is reported as "not running" because there is nothing to join. That
+// is the right answer for "has the cleaner stopped", but it is not evidence
+// that a cleaner ever existed; a test that needs to prove the worker ran must
+// assert that separately (see TestCleanerStartsLazily).
 func cleanerRunning[T CacheAble](m *Memcache[T]) bool {
+	stopped := m.state.stopped
+	if stopped == nil {
+		// No worker was ever started, so there is nothing running to join.
+		return false
+	}
 	select {
-	case <-m.state.stopped:
+	case <-stopped:
 		return false
 	default:
 		return true

@@ -77,8 +77,8 @@ func main() {
   24 threads with 64 shards); `Stats()` then reports only `Capacity` and
   `Entries`. Counters stay on by default.
 - The background cleaner starts on the first real TTL write, so a TTL-enabled
-  cache that never stores a TTL holds no worker goroutine. An empty expiry heap
-  has no timer at all.
+  cache that never stores a TTL holds no worker goroutine and none of its
+  channels. An empty expiry heap has no timer at all.
 - Use `WithLRU`/`WithOptions` to construct caches; the zero value is not
   initialized. Do not copy cache handles. Always call `Close` for timely cleanup.
   Abandoned handles have a best-effort GC finalizer, which is not a substitute for
@@ -111,7 +111,10 @@ no single shard lock is held for the whole sweep. `Stats()` is O(shards).
 
 The default configuration measured about 83 bytes of live heap per resident int
 entry at 100K entries with a pre-generated key set (cache-only, key strings
-excluded); counting freshly allocated keys raises it to about 104 bytes. One
+excluded); counting freshly allocated keys raises it to about 104 bytes. An idle
+instance costs about 500 bytes whether or not TTLs are enabled, including its
+registry entry, so 1000 idle TTL-enabled caches fit in about 0.47 MiB; creating
+and closing one costs about 230 ns. One
 exact LRU is preserved. A 24-thread host showed the
 single-shard lookup path flattening, so opt-in sharding (typically 8-64 shards)
 is available; it raises read throughput but loses a small amount of effective
@@ -121,7 +124,13 @@ Background cleanup keeps one worker per cache with a deadline, and none for a
 TTL-enabled cache that never stored one. Across shards the worker sleeps until
 the earliest root, reclaims an adaptive batch (64 up to 4096) per lock round,
 yields between batches, and treats a timer event only as a hint to re-read the
-roots. A heap change wakes it through a one-slot coalescing notification.
+roots. A heap change wakes it through a one-slot coalescing notification, but
+only when the change can matter: a deadline that moves later never wakes the
+worker, because the already-armed timer fires at the older deadline, re-reads the
+real roots, and re-arms. Wakes are sent for an earlier root, for an emptied heap,
+and for an empty-to-non-empty transition. Renewal is the common TTL write and it
+only moves a deadline later, so a cache under sustained renewal keeps one sleeping
+worker instead of one spinning on every shard lock.
 Reclamation is best-effort — it is not a promise that payloads are freed within a
 fixed number of milliseconds. Close stops the timer, waits for the worker, and is
 safe to repeat. Capacity does not bound the size of user payloads or the number of

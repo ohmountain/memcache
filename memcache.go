@@ -76,23 +76,22 @@ func WithLRU[T CacheAble](capacity uint, enableExpired bool) *Memcache[T] {
 // started on the first TTL write, so a TTL-enabled cache that never stores a
 // TTL holds no worker goroutine.
 func WithOptions[T CacheAble](opts Options) *Memcache[T] {
-	return newMemcacheConfigured[T](opts, time.Now, cleanerLazy, true)
+	return newMemcacheConfigured[T](opts, productionClock, cleanerLazy)
 }
 
 // The clock and cleaner switch allow deterministic TTL tests without sleeps.
+// An injected clock carries no monotonic reading, so systemClock keeps the
+// portable Now().Sub(start) path for it.
 func newMemcache[T CacheAble](capacity uint, enableExpired bool, now func() time.Time, startCleaner bool) *Memcache[T] {
 	mode := cleanerNone
 	if startCleaner {
 		mode = cleanerEager
 	}
-	return newMemcacheConfigured[T](Options{Capacity: capacity, EnableExpired: enableExpired}, now, mode, false)
+	return newMemcacheConfigured[T](Options{Capacity: capacity, EnableExpired: enableExpired}, systemClock{now: now}, mode)
 }
 
-// monotonic reports whether now is time.Now itself, so deadline reads can use
-// time.Since's monotonic fast path. The test seams pass an injected clock and
-// must keep the portable Now().Sub(start) path.
-func newMemcacheConfigured[T CacheAble](opts Options, now func() time.Time, mode cleanerMode, monotonic bool) *Memcache[T] {
-	m := newMemcacheWithClockShards[T](opts.Capacity, opts.EnableExpired, systemClock{now: now, monotonic: monotonic}, mode == cleanerEager, opts.Shards, opts.Preallocate, !opts.DisableStats)
+func newMemcacheConfigured[T CacheAble](opts Options, clock cacheClock, mode cleanerMode) *Memcache[T] {
+	m := newMemcacheWithClockShards[T](opts.Capacity, opts.EnableExpired, clock, mode == cleanerEager, opts.Shards, opts.Preallocate, !opts.DisableStats)
 	m.state.autoStart = mode == cleanerLazy
 	return m
 }
@@ -108,10 +107,7 @@ func newMemcacheWithClockShards[T CacheAble](capacity uint, enableExpired bool, 
 	m := &Memcache[T]{state: s}
 	lives.add(s)
 
-	switch {
-	case !enableExpired || capacity == 0:
-		s.closeStopped()
-	case startCleaner:
+	if enableExpired && capacity > 0 && startCleaner {
 		s.startWorkerNow()
 	}
 	// Registry entries and the cleaner refer only to state, so an abandoned

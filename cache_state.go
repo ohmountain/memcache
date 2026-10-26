@@ -18,9 +18,11 @@ const (
 	maxCleanupBatchSize  = 4096
 )
 
-// shard owns one map/list/heap set and the lock that protects them. Padding
-// keeps one shard's lock and hot fields off its neighbour's cache lines; the
-// allocator does not guarantee 64-byte alignment, so this is best effort.
+// shard owns one map/list/heap set and the lock that protects them. The
+// 160-byte body holds the mutex, the map, and the list/heap/free/size fields in
+// the first cache line and a half, and the eight counters from offset 96 to
+// 159 — so hits/misses/sets/deletes share the second line with free and size,
+// while evictions/expirations/peeks/peekHits occupy the third alone.
 type shard[T CacheAble] struct {
 	mu         sync.Mutex
 	cap        int
@@ -39,11 +41,16 @@ type shard[T CacheAble] struct {
 	peeks       uint64
 	peekHits    uint64
 
-	// The 160-byte body plus this 48-byte pad makes a 208-byte object. The
-	// next shard's lock then starts in a line occupied only by this shard's
-	// padding rather than by its hot fields; the allocator does not guarantee
-	// 64-byte alignment, so this separation is best effort only.
-	_ [48]byte
+	// This 32-byte pad makes the object 192 bytes, which Go allocates from a
+	// class whose minimum alignment is 64 bytes (measured: 192-byte objects
+	// land at 64-byte offsets every time, while 160-byte objects alternate
+	// between offsets 0 and 32). Each shard therefore starts on a cache-line
+	// boundary and covers exactly three lines, so neither a neighbour in the
+	// same multi-shard cache nor an unrelated single-shard cache allocated
+	// next to it can share a line with its hot fields. A 48-byte pad was used
+	// before; 208-byte objects are only 16-byte aligned, so that layout relied
+	// on a phase argument instead of alignment and cost 16 more bytes.
+	_ [32]byte
 }
 
 // cacheState is retained by the registry and cleaner, independently of the
@@ -63,18 +70,34 @@ type cacheState[T CacheAble] struct {
 	clock        cacheClock
 	start        time.Time
 
-	// wake is a one-slot invalidation signal for the cleaner. It carries no
-	// deadline: a notification only means "re-read the real heap roots".
-	wake chan struct{}
-
+	// wake, done, and stopped exist only once a cleaner worker does. They are
+	// created by startWorkerNow under lifeMu before the goroutine starts, so a
+	// cache that never writes a TTL holds neither a goroutine nor its channels
+	// (about 220 bytes: two of the three ~112-byte channels are unconditional
+	// in a TTL-enabled cache, and all three are for one that is idle). A nil
+	// stopped means "no worker was ever started", which is exactly the case
+	// that needs no join.
+	//
+	// wake is not an immutable field: notifyCleaner may only read it after
+	// observing workerStarted, which startWorkerNow publishes after assigning
+	// wake. A caller that still observes zero has no worker to notify, and the
+	// worker's first deadlineSnapshot acquires each shard lock, which is itself
+	// ordered after every writer that already released one.
+	wake    chan struct{}
 	done    chan struct{}
 	stopped chan struct{}
+
+	// teardown lets a concurrent second Close wait until the first one has
+	// finished emptying and unregistering the cache. Add happens under lifeMu
+	// before the closed flag is published, and every Wait happens after
+	// reacquiring lifeMu, so Add can never race a Wait. It is embedded, so it
+	// costs no allocation.
+	teardown sync.WaitGroup
 
 	lifeMu        sync.Mutex
 	autoStart     bool
 	started       bool
 	workerStarted uint32
-	stopOnce      sync.Once
 	closed        uint32
 }
 
@@ -139,8 +162,6 @@ func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheCl
 		enableExpired: enableExpired,
 		collectStats:  collectStats,
 		clock:         clock,
-		done:          make(chan struct{}),
-		stopped:       make(chan struct{}),
 	}
 	if n > 1 {
 		// Seed only sharded caches; the unsharded path never hashes. This
@@ -150,9 +171,6 @@ func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheCl
 	}
 	if enableExpired {
 		s.start = clock.Now()
-	}
-	if enableExpired && capacity > 0 {
-		s.wake = make(chan struct{}, 1)
 	}
 
 	base := int(capacity) / n
@@ -167,7 +185,16 @@ func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheCl
 		if i < rem {
 			shardCap++
 		}
-		s.shards[i] = &shard[T]{cap: shardCap, m: make(map[string]*node[T], hint)}
+		sh := &shard[T]{cap: shardCap}
+		// Leave the map nil unless preallocation was requested: an idle cache
+		// then pays no map header, and Clear/Close stop allocating one per
+		// shard they are about to empty. Reads, len, range, and delete on a
+		// nil map are all safe, so the first new-key insert is the only site
+		// that has to create it.
+		if hint > 0 {
+			sh.m = make(map[string]*node[T], hint)
+		}
+		s.shards[i] = sh
 	}
 	return s
 }
@@ -185,11 +212,19 @@ func (s *cacheState[T]) shardFor(key string) *shard[T] {
 	return s.shards[hashKey(key, s.seed)&s.mask]
 }
 
+// ttlCapable reports whether this cache can ever hold an expiry record. Both
+// fields are immutable after construction, so this replaces the old "wake is
+// non-nil" probe now that wake is created only when a worker starts.
+func (s *cacheState[T]) ttlCapable() bool { return s.enableExpired && s.capacity > 0 }
+
 // notifyCleaner wakes the worker after a heap mutation. The one-slot channel
 // coalesces bursts, and a dropped send is harmless because the worker re-reads
 // the current heap roots after every wake.
+//
+// The workerStarted load must come first: it is the publication barrier that
+// makes the wake channel assignment safe to read without lifeMu.
 func (s *cacheState[T]) notifyCleaner() {
-	if s.wake == nil {
+	if atomic.LoadUint32(&s.workerStarted) == 0 {
 		return
 	}
 	select {
@@ -199,9 +234,9 @@ func (s *cacheState[T]) notifyCleaner() {
 }
 
 // ensureCleaner starts the one worker on the first real TTL write. Public
-// caches that never set a TTL therefore hold no goroutine at all.
+// caches that never set a TTL therefore hold no goroutine and no channels.
 func (s *cacheState[T]) ensureCleaner() {
-	if !s.autoStart || s.wake == nil || s.isClosed() {
+	if !s.autoStart || !s.ttlCapable() || s.isClosed() {
 		return
 	}
 	// The common case is a worker that has already been started; avoid the
@@ -214,21 +249,24 @@ func (s *cacheState[T]) ensureCleaner() {
 
 // startWorkerNow starts the worker regardless of autoStart. Constructors use it
 // for the eager test seam; public caches use ensureCleaner on the first TTL.
+// The worker's channels are created here rather than at construction so an
+// unused TTL cache pays for neither of them.
 func (s *cacheState[T]) startWorkerNow() {
-	if s.wake == nil || s.isClosed() {
+	if !s.ttlCapable() || s.isClosed() {
 		return
 	}
 	s.lifeMu.Lock()
 	if !s.started && !s.isClosed() {
+		s.wake = make(chan struct{}, 1)
+		s.done = make(chan struct{})
+		s.stopped = make(chan struct{})
 		s.started = true
+		// Publish the channels before the workerStarted store: notifyCleaner
+		// reads wake without lifeMu, so it must observe a non-nil channel.
 		atomic.StoreUint32(&s.workerStarted, 1)
 		go s.runCleaner()
 	}
 	s.lifeMu.Unlock()
-}
-
-func (s *cacheState[T]) closeStopped() {
-	s.stopOnce.Do(func() { close(s.stopped) })
 }
 
 func (s *shard[T]) pushFront(n *node[T]) {
@@ -346,21 +384,43 @@ func (s *shard[T]) reclaimLocked(now int64, collectStats bool) {
 }
 
 func (s *shard[T]) clearLocked() {
-	s.m = make(map[string]*node[T])
+	s.m = nil
 	s.head, s.tail = nil, nil
 	s.heap = nil
 	s.free = nil
 	s.size = 0
 }
 
-// rootDeadline is the earliest deadline in this shard (zero when none). The
-// cleaner only needs a wake when that value changes; recency updates and
-// renewals that do not change the minimum leave it untouched.
+// rootDeadline is the earliest deadline in this shard (zero when none).
 func (s *shard[T]) rootDeadline() int64 {
 	if len(s.heap) == 0 {
 		return 0
 	}
 	return s.heap[0].deadline
+}
+
+// rootNeedsWake reports whether the cleaner must re-examine its timer after one
+// shard's earliest deadline moved from before to after. A root that only moves
+// later (both values nonzero) can never make the armed timer too late: the
+// timer fires at the older, earlier deadline, the worker re-reads the real
+// roots, and re-arms. Every other change needs a wake, because an earlier root
+// needs an earlier timer and an emptied or newly non-empty heap needs the timer
+// stopped or armed.
+//
+// This filter is what keeps a cache under sustained TTL renewal from spinning
+// the worker. Renewal pushes a deadline later, which is the common TTL write
+// shape; notifying those changes made the one-slot wake permanently full, so
+// the worker looped over every shard lock without ever reclaiming anything.
+//
+// Zero means "this shard's heap is empty", so an emptied heap arrives here as
+// after == 0 with before > 0, which the after < before test already covers.
+// There is deliberately no separate empty-heap clause: adding one back is
+// equivalent, but it reads as if it carried a condition of its own.
+func rootNeedsWake(before, after int64) bool {
+	if before == after {
+		return false
+	}
+	return before == 0 || after < before
 }
 
 func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) {
@@ -385,20 +445,24 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		return
 	}
 	n, ok := sh.m[key]
-	rootBefore := sh.rootDeadline()
+	var oldDeadline int64
+	if ok {
+		oldDeadline = n.deadline
+	}
 
-	// The clock is read only when a deadline participates in this write: an
-	// expiring target, a new TTL, or a full shard whose expiry heap can have a
-	// due root. A cache holding only non-expiring entries never reads it.
-	needNow := expiring
-	if ok && n.deadline != 0 {
-		needNow = true
-	}
-	if !ok && sh.size >= sh.cap && len(sh.heap) > 0 {
-		needNow = true
-	}
+	// One set of predicates serves the clock read, the root tracking, and the
+	// reclaim step, so a full-shard insert does not re-evaluate them.
+	reclaim := !ok && sh.size >= sh.cap
+	// The heap is touched when this write adds a deadline, cancels one, or
+	// reclaims a due root from a full shard.
+	touchesHeap := expiring || oldDeadline != 0 || (reclaim && len(sh.heap) > 0)
+
+	// The clock is read only when a deadline participates in this write. A
+	// cache holding only non-expiring entries never reads it. The read stays
+	// inside the critical section: with one shard it is cheaper to keep the
+	// lock busy than to shorten the hold (measured, see the round-3 report).
 	var now int64
-	if needNow {
+	if touchesHeap {
 		now = s.nowNanos()
 	}
 
@@ -410,7 +474,17 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		}
 	}
 
-	if ok && n.deadline != 0 && n.deadline <= now {
+	// Renewing an existing deadline to a later value can only raise this
+	// shard's root, which the armed timer already covers, so skip both root
+	// reads. This is the dominant TTL write shape.
+	extends := expiring && oldDeadline != 0 && deadline > oldDeadline
+	trackRoot := touchesHeap && !extends
+	var rootBefore int64
+	if trackRoot {
+		rootBefore = sh.rootDeadline()
+	}
+
+	if oldDeadline != 0 && oldDeadline <= now {
 		// An expired target is treated as absent: remove only its own record.
 		if s.collectStats {
 			sh.expirations++
@@ -423,11 +497,14 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		n.value = value
 		sh.moveFront(n)
 	} else {
-		if sh.size >= sh.cap {
+		if reclaim {
 			sh.reclaimLocked(now, s.collectStats)
 		}
 		n = sh.acquire(key, value)
 		sh.pushFront(n)
+		if sh.m == nil {
+			sh.m = make(map[string]*node[T])
+		}
 		sh.m[key] = n
 		sh.size++
 	}
@@ -444,7 +521,7 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 	if s.collectStats {
 		sh.sets++
 	}
-	changed := sh.rootDeadline() != rootBefore
+	changed := trackRoot && rootNeedsWake(rootBefore, sh.rootDeadline())
 	sh.mu.Unlock()
 	if changed {
 		s.notifyCleaner()
@@ -473,12 +550,15 @@ func (s *cacheState[T]) lookup(key string) (T, bool) {
 		return zero, false
 	}
 	if n.deadline != 0 && n.deadline <= s.nowNanos() {
-		rootBefore := sh.rootDeadline()
+		wasRoot := n.expiryIndex == 0
 		if s.collectStats {
 			sh.expirations++
 		}
 		sh.removeLocked(n)
-		changed := sh.rootDeadline() != rootBefore
+		// Removing an entry can only raise the shard root or empty the heap,
+		// and an armed timer already covers a root that moved later. Only an
+		// emptied heap needs the worker to stop its timer.
+		changed := wasRoot && len(sh.heap) == 0
 		if s.collectStats {
 			sh.misses++
 		}
@@ -547,12 +627,12 @@ func (s *cacheState[T]) delete(key string) {
 	}
 	changed := false
 	if n, ok := sh.m[key]; ok {
-		rootBefore := sh.rootDeadline()
+		wasRoot := n.expiryIndex == 0
 		if s.collectStats {
 			sh.deletes++
 		}
 		sh.removeLocked(n)
-		changed = sh.rootDeadline() != rootBefore
+		changed = wasRoot && len(sh.heap) == 0
 	}
 	sh.mu.Unlock()
 	if changed {
@@ -635,22 +715,32 @@ func (s *cacheState[T]) clearShards() {
 
 func (s *cacheState[T]) close() {
 	s.lifeMu.Lock()
+	// done and stopped are written only under lifeMu, so reading them here is
+	// race-free. Both are nil when no worker was ever started.
+	stoppable := s.stopped
 	if s.isClosed() {
 		s.lifeMu.Unlock()
-		<-s.stopped
+		// Another Close is already tearing this cache down. Join it rather
+		// than returning while the contents and registration still exist.
+		s.teardown.Wait()
 		return
 	}
+	// Publish "closing" only after the teardown count is raised, so a closer
+	// that observes the flag can safely Wait.
+	s.teardown.Add(1)
 	atomic.StoreUint32(&s.closed, 1)
-	close(s.done)
-	if !s.started {
-		s.closeStopped()
+	if s.done != nil {
+		close(s.done)
 	}
 	s.lifeMu.Unlock()
 
+	defer s.teardown.Done()
 	s.clearShards()
 	// Never hold a shard lock while acquiring the registry.
 	lives.remove(s)
-	<-s.stopped
+	if stoppable != nil {
+		<-stoppable
+	}
 }
 
 func (s *cacheState[T]) purgeDueBatch(now int64, limit int) int {

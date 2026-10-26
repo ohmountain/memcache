@@ -64,13 +64,12 @@ func TestCleanerStartsLazily(t *testing.T) {
 	}
 	m.Close()
 
-	// Closing a TTL cache that never started a worker must not hang.
+	// Closing a TTL cache that never started a worker must not hang, and must
+	// not have allocated the walker's channels at all.
 	idle := WithLRU[int](8, true)
 	idle.Close()
-	select {
-	case <-idle.state.stopped:
-	default:
-		t.Fatal("lazy close did not close stopped")
+	if idle.state.wake != nil || idle.state.done != nil || idle.state.stopped != nil {
+		t.Fatal("a TTL cache that never stored a TTL allocated worker channels")
 	}
 }
 
@@ -524,6 +523,56 @@ func TestFootprintBudget(t *testing.T) {
 	}
 }
 
+// TestIdleInstanceFootprint guards the fixed cost of a cache that stores
+// nothing, which is the "many small caches" budget: a TTL-enabled cache that
+// never writes a TTL must not allocate the cleaner's channels, and a shard must
+// stay in the 64-byte-aligned 192-byte class. Measured about 497 B (non-TTL)
+// and 494 B (TTL-idle) here on linux/amd64 with Go 1.27, against ~805/910 B
+// before the round-3 layout. The 560 B budget leaves about 12% headroom for
+// allocator and size-class variation while still failing the old layout, and it
+// is tighter than the "1000 idle TTL caches in 0.5 MiB" gate (500 B/instance)
+// rather than looser than it.
+func TestIdleInstanceFootprint(t *testing.T) {
+	const instances = 5000
+	for _, tc := range []struct {
+		name string
+		ctor func() *Memcache[int]
+	}{
+		{"nonttl", func() *Memcache[int] { return WithLRU[int](1024, false) }},
+		{"ttl-idle", func() *Memcache[int] { return WithLRU[int](1024, true) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The handle slice is allocated before the baseline sample, so it
+			// does not count toward the per-instance figure.
+			caches := make([]*Memcache[int], instances)
+			runtime.GC()
+			runtime.GC()
+			var before runtime.MemStats
+			runtime.ReadMemStats(&before)
+
+			for i := range caches {
+				caches[i] = tc.ctor()
+			}
+
+			runtime.GC()
+			runtime.GC()
+			var after runtime.MemStats
+			runtime.ReadMemStats(&after)
+			perInstance := float64(after.HeapAlloc-before.HeapAlloc) / float64(instances)
+
+			for _, m := range caches {
+				m.Close()
+			}
+			runtime.KeepAlive(caches)
+
+			t.Logf("idle instance = %.1f B", perInstance)
+			if perInstance > 560 {
+				t.Fatalf("idle instance = %.1f B, want <=560", perInstance)
+			}
+		})
+	}
+}
+
 func TestShardCountRoundsDown(t *testing.T) {
 	for _, tc := range []struct {
 		capacity  uint
@@ -549,8 +598,9 @@ func TestShardCountRoundsDown(t *testing.T) {
 }
 
 // TestIntrusiveLayout pins the 64-bit allocations the performance docs depend
-// on: a 56-byte node lands in the 64-byte size class, and the shard padding
-// keeps the next shard's mutex out of this shard's hot fields.
+// on: a 56-byte node lands in the 64-byte size class and a 192-byte shard lands
+// in the 64-byte-aligned class, so one shard can never share a cache line with
+// a neighbour.
 func TestIntrusiveLayout(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) != 8 {
 		t.Skip("layout is documented for 64-bit targets")
@@ -558,9 +608,29 @@ func TestIntrusiveLayout(t *testing.T) {
 	if got := unsafe.Sizeof(node[uint64]{}); got != 56 {
 		t.Fatalf("node[uint64] = %d bytes, want 56 (64-byte size class)", got)
 	}
-	if got := unsafe.Sizeof(shard[uint64]{}); got != 208 {
-		t.Fatalf("shard[uint64] = %d bytes, want 208 (160-byte body + 48-byte pad)", got)
+	// 192 is a size class with 64-byte minimum alignment, so every shard
+	// starts on a cache-line boundary and owns exactly three lines.
+	if got := unsafe.Sizeof(shard[uint64]{}); got != 192 {
+		t.Fatalf("shard[uint64] = %d bytes, want 192 (160-byte body + 32-byte pad)", got)
 	}
+	// The alignment, not the size, is what the padding buys. Pin it directly:
+	// a size-only check would still pass if the body/pad split changed in a way
+	// that lost the 64-byte alignment. Each shard must be allocated on its own
+	// so it comes from the 192-byte size class; a slice of several shards would
+	// be one larger allocation and would not test the class at all. If this
+	// fails on a newer toolchain, the 192-byte choice needs revisiting, not the
+	// test.
+	shards := make([]*shard[uint64], 8)
+	for i := range shards {
+		shards[i] = new(shard[uint64])
+	}
+	for i, sh := range shards {
+		if off := uintptr(unsafe.Pointer(sh)) % 64; off != 0 {
+			t.Fatalf("shard[%d] allocated at offset %d within a cache line, want 0: the "+
+				"192-byte layout no longer guarantees 64-byte alignment", i, off)
+		}
+	}
+	runtime.KeepAlive(shards)
 }
 
 func TestMassRemovalBoundsFreelist(t *testing.T) {
