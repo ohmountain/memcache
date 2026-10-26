@@ -176,10 +176,12 @@ two halves and comparing them with benchstat before believing any delta.
   post-expiry Set collapses from 7.21ms to 2.19µs, but the old ticker cleaner
   still full-purges, so the concentrated-expiry P99 and full-reclamation gates
   are not met and B1 is not a Stage B pass.
-- `2026-10-25-ttl-b2.md` — the B2 Stage B acceptance report against A plus the
-  B1→B2 attribution. Earliest-deadline scheduling with batches of 64 cuts the
-  valid-tier burst Set P99 by 99.4% and removes the idle periodic wake. A
-  post-review fix removed scheduler work from the lookup hit path, so the
-  non-TTL and allocation gates pass. Stage B is still not a clean pass: full
-  reclamation at expiry-burst 50K is 2.17–2.35× the control, which is the
-  design-review item, and the Linux/Windows matrix was not run here.
+- `2026-10-25-ttl-b2.md` — the B2 Stage B acceptance report against A on the
+  final runtime plus the B1→B2 attribution. Earliest-deadline scheduling with
+  batches of 64 cuts the valid-tier burst Set P99 by ~99.3% (20/40-pair
+  samples) and removes the idle periodic wake. A post-review fix removed
+  scheduler work from the lookup hit path, closing the non-TTL and allocation
+  gates. Reclamation is 1.52× the control under a common 1ms heap-length
+  measurement; the harness's 10ms full-snapshot monitor reads 2.30–2.42× and is
+  documented as resolution-limited. Every measured gate passes; the
+  Linux/Windows matrix was not run, and that is the remaining acceptance item.
