@@ -80,18 +80,22 @@ func TestApproximateReadsBoundary(t *testing.T) {
 // clock: after a purge round the shard holds the worker's clock sample, so a
 // read inside the observation slack hits while the entry is unobserved, and
 // misses once the worker has reclaimed it.
+//
+// The worker is nudged through notifyCleaner, never by firing the fake timer
+// by hand: a hand-fired event can land inside the worker's arm() stop/reset
+// window and be dropped, and a fake timer never fires on its own, so the
+// wait would hang. The wake path is the production seam ("roots moved,
+// re-check now") and converges regardless of scheduling.
 func TestApproximateReadsCleanerPublishes(t *testing.T) {
 	fake := newFakeClock(modelEpoch)
 	m := newMemcacheWithClockShards[int](16, true, fake, true, 1, shardSlotTarget, false, true, true)
 	t.Cleanup(m.Close)
-	ch := seamSignals(fake)
 	m.SetExpire("a", 1, 1)
 	m.SetExpire("b", 2, 2)
-	waitArmedDelay(t, ch, fake, time.Second)
 
 	fake.Advance(1500 * time.Millisecond)
-	fake.timer(0).fire()
-	waitForSeam(t, ch, "purge of the first entry", func() bool { return m.Len() == 1 })
+	m.state.notifyCleaner()
+	waitEventually(t, "purge of the first entry", func() bool { return m.Len() == 1 })
 	requireMissing(t, m, "a")
 
 	m.state.shards[0].mu.Lock()
@@ -106,12 +110,7 @@ func TestApproximateReadsCleanerPublishes(t *testing.T) {
 	fake.Advance(time.Second)
 	requireValue(t, m, "b", 2)
 
-	waitArmedDelay(t, ch, fake, 500*time.Millisecond)
-	fake.Advance(time.Second)
-	fake.timer(0).fire()
-	// The purge after this fire leaves the worker's timer consumed, so its
-	// next stop skips fakeTimer.Stop and fires no seam hook — waitForSeam
-	// would sleep forever. Poll for the state change instead.
+	m.state.notifyCleaner()
 	waitEventually(t, "purge of the second entry", func() bool { return m.Len() == 0 })
 	requireMissing(t, m, "b")
 }
