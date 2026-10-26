@@ -31,6 +31,10 @@ func (c *countingClock) Now() time.Time {
 	return c.fakeClock.Now()
 }
 
+// Since routes through the counting Now so the idle-wakeup proofs keep seeing
+// every clock observation made by deadline reads.
+func (c *countingClock) Since(start time.Time) time.Duration { return c.Now().Sub(start) }
+
 func (c *countingClock) nowCallCount() int { return int(atomic.LoadInt32(&c.nowCalls)) }
 
 // stepClock gates worker Now calls: with the gate armed, each call reports
@@ -61,6 +65,10 @@ func (c *stepClock) Now() time.Time {
 func (c *stepClock) armGate() { atomic.StoreInt32(&c.armed, 1) }
 
 func (c *stepClock) disarmGate() { atomic.StoreInt32(&c.armed, 0) }
+
+// Since goes through the gated Now so the interleaving tests still observe (and
+// can hold) every deadline read the worker makes.
+func (c *stepClock) Since(start time.Time) time.Duration { return c.Now().Sub(start) }
 
 func newCleanerFixture(t *testing.T, capacity uint) (*Memcache[int], *fakeClock, *countingClock) {
 	t.Helper()

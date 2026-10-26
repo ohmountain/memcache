@@ -55,8 +55,13 @@ type cacheState[T CacheAble] struct {
 	seed          uint64
 	capacity      uint
 	enableExpired bool
-	clock         cacheClock
-	start         time.Time
+	// collectStats gates every per-operation counter store. Those stores dirty
+	// a shard cache line that otherwise stays read-only on Peek, so at high core
+	// counts they measurably cap read throughput; Options.DisableStats turns
+	// them off for callers that do not export the counters.
+	collectStats bool
+	clock        cacheClock
+	start        time.Time
 
 	// wake is a one-slot invalidation signal for the cleaner. It carries no
 	// deadline: a notification only means "re-read the real heap roots".
@@ -90,12 +95,26 @@ func shardCount(capacity uint, requested int) int {
 
 // hashKey mixes the per-cache seed so an attacker cannot precompute keys that
 // all land in one shard. The unsharded path never calls it, so every real call
-// uses the nonzero seed installed by the constructor.
+// uses the nonzero seed installed by the constructor. It consumes 8 bytes per
+// round because a byte-at-a-time FNV loop cost ~6ns at 16-byte keys and ~85ns
+// at 128-byte keys, which dominated sharded operations on realistic (URL,
+// composite, UUID) keys. The final avalanche gives the low bits used by the
+// shard mask full diffusion.
 func hashKey(s string, seed uint64) uint64 {
-	h := uint64(14695981039346656037) ^ seed
-	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i])
-		h *= 1099511628211
+	const prime = 0x9e3779b97f4a7c15
+	h := seed ^ prime
+	for len(s) >= 8 {
+		h = (h ^ read8(s)) * prime
+		h ^= h >> 29
+		s = s[8:]
+	}
+	if len(s) > 0 {
+		var tail uint64
+		for i := 0; i < len(s); i++ {
+			tail |= uint64(s[i]) << (8 * i)
+		}
+		h = (h ^ tail) * prime
+		h ^= h >> 29
 	}
 	h ^= h >> 33
 	h *= 0xff51afd7ed558ccd
@@ -104,12 +123,21 @@ func hashKey(s string, seed uint64) uint64 {
 	return h
 }
 
-func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, shards int, preallocate bool) *cacheState[T] {
+// read8 assembles a little-endian word from the first eight bytes of s. Bounds
+// are the caller's responsibility; the explicit byte loads keep the loop
+// allocation-free on every supported toolchain.
+func read8(s string) uint64 {
+	return uint64(s[0]) | uint64(s[1])<<8 | uint64(s[2])<<16 | uint64(s[3])<<24 |
+		uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56
+}
+
+func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, shards int, preallocate bool, collectStats bool) *cacheState[T] {
 	n := shardCount(capacity, shards)
 	s := &cacheState[T]{
 		mask:          uint64(n - 1),
 		capacity:      capacity,
 		enableExpired: enableExpired,
+		collectStats:  collectStats,
 		clock:         clock,
 		done:          make(chan struct{}),
 		stopped:       make(chan struct{}),
@@ -146,7 +174,7 @@ func newCacheState[T CacheAble](capacity uint, enableExpired bool, clock cacheCl
 
 func (s *cacheState[T]) isClosed() bool { return atomic.LoadUint32(&s.closed) != 0 }
 
-func (s *cacheState[T]) nowNanos() int64 { return s.nanosAt(s.clock.Now()) }
+func (s *cacheState[T]) nowNanos() int64 { return int64(s.clock.Since(s.start)) }
 
 func (s *cacheState[T]) nanosAt(t time.Time) int64 { return int64(t.Sub(s.start)) }
 
@@ -289,10 +317,12 @@ func (s *shard[T]) removeLocked(n *node[T]) {
 	}
 }
 
-func (s *shard[T]) purgeExpiredLocked(now int64, limit int) int {
+func (s *shard[T]) purgeExpiredLocked(now int64, limit int, collectStats bool) int {
 	removed := 0
 	for removed < limit && len(s.heap) > 0 && s.heap[0].deadline <= now {
-		s.expirations++
+		if collectStats {
+			s.expirations++
+		}
 		s.removeLocked(s.heap[0])
 		removed++
 	}
@@ -302,14 +332,16 @@ func (s *shard[T]) purgeExpiredLocked(now int64, limit int) int {
 // reclaimLocked frees exactly one slot: a due heap root when one exists,
 // otherwise the LRU tail. It never scans for further expired entries, so one
 // write's reclamation work stays bounded.
-func (s *shard[T]) reclaimLocked(now int64) {
-	if s.purgeExpiredLocked(now, 1) > 0 {
+func (s *shard[T]) reclaimLocked(now int64, collectStats bool) {
+	if s.purgeExpiredLocked(now, 1, collectStats) > 0 {
 		return
 	}
 	if s.tail == nil {
 		return
 	}
-	s.evictions++
+	if collectStats {
+		s.evictions++
+	}
 	s.removeLocked(s.tail)
 }
 
@@ -380,7 +412,9 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 
 	if ok && n.deadline != 0 && n.deadline <= now {
 		// An expired target is treated as absent: remove only its own record.
-		sh.expirations++
+		if s.collectStats {
+			sh.expirations++
+		}
 		sh.removeLocked(n)
 		n, ok = nil, false
 	}
@@ -390,7 +424,7 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 		sh.moveFront(n)
 	} else {
 		if sh.size >= sh.cap {
-			sh.reclaimLocked(now)
+			sh.reclaimLocked(now, s.collectStats)
 		}
 		n = sh.acquire(key, value)
 		sh.pushFront(n)
@@ -407,7 +441,9 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 	case deadline != 0:
 		sh.heap.push(n)
 	}
-	sh.sets++
+	if s.collectStats {
+		sh.sets++
+	}
 	changed := sh.rootDeadline() != rootBefore
 	sh.mu.Unlock()
 	if changed {
@@ -429,17 +465,23 @@ func (s *cacheState[T]) lookup(key string) (T, bool) {
 	}
 	n, ok := sh.m[key]
 	if !ok {
-		sh.misses++
+		if s.collectStats {
+			sh.misses++
+		}
 		sh.mu.Unlock()
 		var zero T
 		return zero, false
 	}
 	if n.deadline != 0 && n.deadline <= s.nowNanos() {
 		rootBefore := sh.rootDeadline()
-		sh.expirations++
+		if s.collectStats {
+			sh.expirations++
+		}
 		sh.removeLocked(n)
 		changed := sh.rootDeadline() != rootBefore
-		sh.misses++
+		if s.collectStats {
+			sh.misses++
+		}
 		sh.mu.Unlock()
 		if changed {
 			s.notifyCleaner()
@@ -448,7 +490,9 @@ func (s *cacheState[T]) lookup(key string) (T, bool) {
 		return zero, false
 	}
 	sh.moveFront(n)
-	sh.hits++
+	if s.collectStats {
+		sh.hits++
+	}
 	value := n.value
 	sh.mu.Unlock()
 	return value, true
@@ -469,7 +513,9 @@ func (s *cacheState[T]) peek(key string) (T, bool) {
 		var zero T
 		return zero, false
 	}
-	sh.peeks++
+	if s.collectStats {
+		sh.peeks++
+	}
 	n, ok := sh.m[key]
 	if !ok {
 		sh.mu.Unlock()
@@ -481,7 +527,9 @@ func (s *cacheState[T]) peek(key string) (T, bool) {
 		var zero T
 		return zero, false
 	}
-	sh.peekHits++
+	if s.collectStats {
+		sh.peekHits++
+	}
 	value := n.value
 	sh.mu.Unlock()
 	return value, true
@@ -500,7 +548,9 @@ func (s *cacheState[T]) delete(key string) {
 	changed := false
 	if n, ok := sh.m[key]; ok {
 		rootBefore := sh.rootDeadline()
-		sh.deletes++
+		if s.collectStats {
+			sh.deletes++
+		}
 		sh.removeLocked(n)
 		changed = sh.rootDeadline() != rootBefore
 	}
@@ -533,7 +583,7 @@ func (s *cacheState[T]) Size() uint {
 				sh.mu.Unlock()
 				return 0
 			}
-			removed := sh.purgeExpiredLocked(now, sizePurgeBatch)
+			removed := sh.purgeExpiredLocked(now, sizePurgeBatch, s.collectStats)
 			if removed > 0 {
 				purged = true
 			}
@@ -610,7 +660,7 @@ func (s *cacheState[T]) purgeDueBatch(now int64, limit int) int {
 			break
 		}
 		sh.mu.Lock()
-		removed += sh.purgeExpiredLocked(now, limit-removed)
+		removed += sh.purgeExpiredLocked(now, limit-removed, s.collectStats)
 		sh.mu.Unlock()
 	}
 	return removed

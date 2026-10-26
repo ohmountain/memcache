@@ -32,6 +32,10 @@ func (c *fakeClock) Now() time.Time {
 	return c.now
 }
 
+// Since keeps the fake deterministic: its values carry no monotonic reading, so
+// time.Since would compare against the wall clock instead of c.now.
+func (c *fakeClock) Since(start time.Time) time.Duration { return c.Now().Sub(start) }
+
 func (c *fakeClock) Advance(d time.Duration) {
 	c.mu.Lock()
 	c.now = c.now.Add(d)

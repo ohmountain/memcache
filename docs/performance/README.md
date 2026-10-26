@@ -253,3 +253,12 @@ two halves and comparing them with benchstat before believing any delta.
   links in `node` instead of a separate `lruLink`: cache-only footprint,
   key-inclusive footprint, single-thread paths, and 8/24-thread `Lookup`.
   Its result was adopted: the production layout now uses the embedded node.
+- `2026-10-26-round2-optimizations.md` — the next measured round: deadline
+  reads take `time.Since`'s monotonic fast path (TTL `Lookup` −28%, `Peek`
+  −29%, `RenewTTL` −14%), the shard router uses an 8-byte-chunked seeded hash
+  (sharded `Lookup` −28% at 16-byte keys to −59% at 64-byte keys), and
+  `Options.DisableStats` removes the per-operation counter stores (24-thread
+  64-shard `Lookup` −12%, `Set` −19%, `Peek` −15%). It also records the
+  measured, unimplemented opportunities (per-instance memory, the lock-bound
+  sharded read ceiling, opt-in eviction policies, TTL heap cost) and their
+  evidence.

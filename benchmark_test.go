@@ -355,3 +355,79 @@ func BenchmarkCacheShardedSetExpire(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkCacheShardedPeek isolates the read path that does not write recency.
+// The two variants differ only in Options.DisableStats, which removes the
+// per-operation counter stores from the shard cache line.
+func BenchmarkCacheShardedPeek(b *testing.B) {
+	keys := numericKeys(1024)
+	for _, shards := range []int{1, 64} {
+		for _, disableStats := range []bool{false, true} {
+			name := fmt.Sprintf("Shards%d", shards)
+			if disableStats {
+				name += "-NoStats"
+			}
+			b.Run(name, func(b *testing.B) {
+				m := WithOptions[int](Options{Capacity: 4096, Shards: shards, DisableStats: disableStats})
+				defer m.Close()
+				for i, key := range keys {
+					m.Set(key, i)
+				}
+				b.ReportAllocs()
+				b.ResetTimer()
+				var worker int64
+				b.RunParallel(func(pb *testing.PB) {
+					w := int(atomic.AddInt64(&worker, 1) - 1)
+					keyIndex := (w * 997) % len(keys)
+					for pb.Next() {
+						m.Peek(keys[keyIndex])
+						keyIndex++
+						if keyIndex == len(keys) {
+							keyIndex = 0
+						}
+					}
+				})
+			})
+		}
+	}
+}
+
+// BenchmarkCacheShardedKeyLength keeps the shard-router cost visible. Numeric
+// keys are 1-4 bytes, so the repository's other benchmarks hide the hash; real
+// keys (URLs, composite IDs) are tens of bytes, where a byte-at-a-time hash
+// dominated the operation.
+func BenchmarkCacheShardedKeyLength(b *testing.B) {
+	for _, n := range []int{8, 16, 32, 64} {
+		keys := make([]string, 1024)
+		for i := range keys {
+			suffix := strconv.Itoa(i)
+			key := make([]byte, n)
+			for j := range key {
+				key[j] = byte('a' + j%26)
+			}
+			copy(key[n-len(suffix):], suffix)
+			keys[i] = string(key)
+		}
+		b.Run(fmt.Sprintf("len%d", n), func(b *testing.B) {
+			m := WithOptions[int](Options{Capacity: 4096, Shards: 64})
+			defer m.Close()
+			for i, key := range keys {
+				m.Set(key, i)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			var worker int64
+			b.RunParallel(func(pb *testing.PB) {
+				w := int(atomic.AddInt64(&worker, 1) - 1)
+				keyIndex := (w * 997) % len(keys)
+				for pb.Next() {
+					m.Lookup(keys[keyIndex])
+					keyIndex++
+					if keyIndex == len(keys) {
+						keyIndex = 0
+					}
+				}
+			})
+		})
+	}
+}

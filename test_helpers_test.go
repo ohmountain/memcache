@@ -63,7 +63,7 @@ func (h *expiryHeap[T]) rebuild() {
 func shardedClockCache(t *testing.T, capacity uint, shards int) (*Memcache[int], *testClock) {
 	t.Helper()
 	clock := &testClock{now: modelEpoch}
-	m := newMemcacheWithClockShards[int](capacity, true, systemClock{now: clock.Now}, false, shards, false)
+	m := newMemcacheWithClockShards[int](capacity, true, systemClock{now: clock.Now}, false, shards, false, true)
 	t.Cleanup(m.Close)
 	return m, clock
 }

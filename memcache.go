@@ -29,11 +29,18 @@ type Options struct {
 	// memory for fewer growth stalls; leave it off for many small or mostly
 	// empty caches.
 	Preallocate bool
+	// DisableStats turns off the hit/miss/set/delete/eviction/expiration
+	// counters. Stats then reports only Capacity and Entries. Each counter
+	// update is a store to a shard cache line that a read-only path such as
+	// Peek otherwise never dirties, so disabling them raises multicore read
+	// throughput; do it when the counters are not exported.
+	DisableStats bool
 }
 
 // Stats is a point-in-time snapshot of cache counters. Entries is physical
 // (Len semantics) and does not purge expired entries. Hits and Misses count
 // Lookup and Get; Peek traffic is reported separately by Peeks and PeekHits.
+// With Options.DisableStats every field except Capacity and Entries stays zero.
 type Stats struct {
 	Capacity    uint
 	Entries     uint
@@ -69,7 +76,7 @@ func WithLRU[T CacheAble](capacity uint, enableExpired bool) *Memcache[T] {
 // started on the first TTL write, so a TTL-enabled cache that never stores a
 // TTL holds no worker goroutine.
 func WithOptions[T CacheAble](opts Options) *Memcache[T] {
-	return newMemcacheConfigured[T](opts.Capacity, opts.EnableExpired, opts.Shards, opts.Preallocate, time.Now, cleanerLazy)
+	return newMemcacheConfigured[T](opts, time.Now, cleanerLazy, true)
 }
 
 // The clock and cleaner switch allow deterministic TTL tests without sleeps.
@@ -78,11 +85,14 @@ func newMemcache[T CacheAble](capacity uint, enableExpired bool, now func() time
 	if startCleaner {
 		mode = cleanerEager
 	}
-	return newMemcacheConfigured[T](capacity, enableExpired, 1, false, now, mode)
+	return newMemcacheConfigured[T](Options{Capacity: capacity, EnableExpired: enableExpired}, now, mode, false)
 }
 
-func newMemcacheConfigured[T CacheAble](capacity uint, enableExpired bool, shards int, preallocate bool, now func() time.Time, mode cleanerMode) *Memcache[T] {
-	m := newMemcacheWithClockShards[T](capacity, enableExpired, systemClock{now: now}, mode == cleanerEager, shards, preallocate)
+// monotonic reports whether now is time.Now itself, so deadline reads can use
+// time.Since's monotonic fast path. The test seams pass an injected clock and
+// must keep the portable Now().Sub(start) path.
+func newMemcacheConfigured[T CacheAble](opts Options, now func() time.Time, mode cleanerMode, monotonic bool) *Memcache[T] {
+	m := newMemcacheWithClockShards[T](opts.Capacity, opts.EnableExpired, systemClock{now: now, monotonic: monotonic}, mode == cleanerEager, opts.Shards, opts.Preallocate, !opts.DisableStats)
 	m.state.autoStart = mode == cleanerLazy
 	return m
 }
@@ -90,11 +100,11 @@ func newMemcacheConfigured[T CacheAble](capacity uint, enableExpired bool, shard
 // newMemcacheWithClock is the single-shard test seam: the injected clock
 // supplies both deadline reads and cleaner scheduling.
 func newMemcacheWithClock[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool) *Memcache[T] {
-	return newMemcacheWithClockShards[T](capacity, enableExpired, clock, startCleaner, 1, false)
+	return newMemcacheWithClockShards[T](capacity, enableExpired, clock, startCleaner, 1, false, true)
 }
 
-func newMemcacheWithClockShards[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool, shards int, preallocate bool) *Memcache[T] {
-	s := newCacheState[T](capacity, enableExpired, clock, shards, preallocate)
+func newMemcacheWithClockShards[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool, shards int, preallocate bool, collectStats bool) *Memcache[T] {
+	s := newCacheState[T](capacity, enableExpired, clock, shards, preallocate, collectStats)
 	m := &Memcache[T]{state: s}
 	lives.add(s)
 

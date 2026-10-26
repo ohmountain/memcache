@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -586,7 +587,7 @@ func TestMassRemovalBoundsFreelist(t *testing.T) {
 
 func TestMassExpiryReleasesHeapBacking(t *testing.T) {
 	clock := &testClock{now: modelEpoch}
-	m := newMemcacheWithClockShards[int](4096, true, systemClock{now: clock.Now}, false, 1, false)
+	m := newMemcacheWithClockShards[int](4096, true, systemClock{now: clock.Now}, false, 1, false, true)
 	defer m.Close()
 	for i := 0; i < 4096; i++ {
 		m.SetExpire(workloadKey(i), i, 1)
@@ -601,5 +602,72 @@ func TestMassExpiryReleasesHeapBacking(t *testing.T) {
 	sh.mu.Unlock()
 	if got > maxIdleHeapCap {
 		t.Fatalf("empty heap retains capacity %d, cap is %d", got, maxIdleHeapCap)
+	}
+}
+
+// TestDisableStatsReportsOnlyEntries pins the Options.DisableStats contract:
+// operations still work, but only the structural fields are reported. The
+// counters exist to be read; when a caller opts out it must not pay a cache-line
+// store per operation, so every counter site is gated.
+func TestDisableStatsReportsOnlyEntries(t *testing.T) {
+	m := WithOptions[int](Options{Capacity: 4, DisableStats: true})
+	defer m.Close()
+	m.Set("a", 1)
+	m.SetExpire("b", 2, 60)
+	m.Lookup("a")
+	m.Lookup("missing")
+	m.Peek("a")
+	m.Peek("missing")
+	m.Delete("a")
+	if got := m.Size(); got != 1 {
+		t.Fatalf("Size = %d, want 1 live entry", got)
+	}
+	stats := m.Stats()
+	if stats.Capacity != 4 || stats.Entries != 1 {
+		t.Fatalf("structural stats = cap %d entries %d, want 4/1", stats.Capacity, stats.Entries)
+	}
+	if stats.Hits != 0 || stats.Misses != 0 || stats.Sets != 0 || stats.Deletes != 0 ||
+		stats.Evictions != 0 || stats.Expirations != 0 || stats.Peeks != 0 || stats.PeekHits != 0 {
+		t.Fatalf("counters recorded with DisableStats: %+v", stats)
+	}
+}
+
+// TestHashKeyDistribution guards the shard router. A poor avalanche would
+// concentrate unrelated keys in one shard, which costs both capacity and
+// throughput long before any benchmark notices; the old byte-at-a-time FNV
+// loop had to be replaced for speed, so its distribution property needs a test.
+func TestHashKeyDistribution(t *testing.T) {
+	const (
+		keys    = 1 << 16
+		buckets = 64
+	)
+	patterns := map[string]func(int) string{
+		"numeric":      func(i int) string { return strconv.Itoa(i) },
+		"sharedPrefix": func(i int) string { return "session:0123456789:" + strconv.Itoa(i) },
+		"uuidLike": func(i int) string {
+			return strconv.FormatInt(int64(i)*2654435761, 16) + "-0123-4567-89ab"
+		},
+	}
+	for name, keyOf := range patterns {
+		counts := make([]int, buckets)
+		for i := 0; i < keys; i++ {
+			counts[hashKey(keyOf(i), 0xfeedfacecafebeef)&(buckets-1)]++
+		}
+		min, max := counts[0], counts[0]
+		for _, c := range counts {
+			if c < min {
+				min = c
+			}
+			if c > max {
+				max = c
+			}
+		}
+		mean := float64(keys) / buckets
+		if float64(max) > mean*1.35 {
+			t.Fatalf("%s: busiest shard has %d keys, mean %.1f (min %d)", name, max, mean, min)
+		}
+		if min == 0 {
+			t.Fatalf("%s: an empty shard for %d keys", name, keys)
+		}
 	}
 }

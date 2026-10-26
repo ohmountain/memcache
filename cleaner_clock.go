@@ -8,6 +8,12 @@ import "time"
 // and no user callback runs on it.
 type cacheClock interface {
 	Now() time.Time
+	// Since reports the elapsed time since start. systemClock uses time.Since
+	// when it wraps the real clock: a Time read from time.Now carries a
+	// monotonic reading, and time.Since's monotonic path skips the wall-clock
+	// read that time.Now().Sub pays for on every TTL operation. Fakes keep
+	// their deterministic Now().Sub(start) behavior.
+	Since(start time.Time) time.Duration
 	NewTimer(time.Duration) cacheTimer
 }
 
@@ -21,12 +27,23 @@ type cacheTimer interface {
 }
 
 // systemClock combines the cache's injected now function with real timers, so
-// deadline decisions and scheduling read the same clock source.
+// deadline decisions and scheduling read the same clock source. monotonic marks
+// a now function that is time.Now itself, which lets Since take time.Since's
+// monotonic fast path. An injected now function must keep the portable
+// Now().Sub(start) path because its values carry no monotonic reading.
 type systemClock struct {
-	now func() time.Time
+	now       func() time.Time
+	monotonic bool
 }
 
 func (c systemClock) Now() time.Time { return c.now() }
+
+func (c systemClock) Since(start time.Time) time.Duration {
+	if c.monotonic {
+		return time.Since(start)
+	}
+	return c.now().Sub(start)
+}
 
 func (c systemClock) NewTimer(d time.Duration) cacheTimer {
 	return systemTimer{timer: time.NewTimer(d)}
