@@ -116,14 +116,15 @@ func TestRealExpiryFixture(t *testing.T) {
 // Scenario flags; -cache-perf-full comes from benchmark_test.go. Cases and
 // their fixed configurations are documented in docs/performance/README.md.
 var (
-	perfCase      = flag.String("cache-perf-case", "", "performance scenario: noop|steady|expiry-burst|expiry-spread|size-burst|idle-empty|idle-future|lifecycle")
-	perfRate      = flag.Int("cache-perf-rate", 10000, "planned requests per second")
-	perfWorkers   = flag.Int("cache-perf-workers", 4, "open-loop workers")
-	perfQueue     = flag.Int("cache-perf-queue", 1024, "open-loop queue bound")
-	perfDuration  = flag.Duration("cache-perf-duration", 3*time.Second, "measurement window")
-	perfInstances = flag.Int("cache-perf-instances", 1, "instance count for idle scenarios (1|100|1000)")
-	perfValue     = flag.String("cache-perf-value", "int", "value type for lifecycle (int|bytes4k)")
-	perfOut       = flag.String("cache-perf-out", "", "output JSON path; must not exist (evidence is never overwritten)")
+	perfCase          = flag.String("cache-perf-case", "", "performance scenario: noop|steady|expiry-burst|expiry-spread|size-burst|idle-empty|idle-future|lifecycle")
+	perfRate          = flag.Int("cache-perf-rate", 10000, "planned requests per second")
+	perfWorkers       = flag.Int("cache-perf-workers", 4, "open-loop workers")
+	perfQueue         = flag.Int("cache-perf-queue", 1024, "open-loop queue bound")
+	perfDuration      = flag.Duration("cache-perf-duration", 3*time.Second, "measurement window")
+	perfExpiryMeasure = flag.String("cache-perf-expiry-measure", "both", "expiry measurements: both|latency|reclaim")
+	perfInstances     = flag.Int("cache-perf-instances", 1, "instance count for idle scenarios (1|100|1000)")
+	perfValue         = flag.String("cache-perf-value", "int", "value type for lifecycle (int|bytes4k)")
+	perfOut           = flag.String("cache-perf-out", "", "output JSON path; must not exist (evidence is never overwritten)")
 )
 
 // perfRecord is the JSON evidence of one scenario run. Durations encode as
@@ -150,6 +151,10 @@ type perfRecord struct {
 	// are still pinned by KeepAlive; Resources holds the after-release
 	// sample of the same heap.
 	ResourcesHeld map[string]uint64 `json:"resources_held,omitempty"`
+	// Empty preserves the original schema-1 record: independent latency and
+	// reclamation runs. Reclaim-only records leave Load zero, since monitor
+	// latencies include snapshot interference and are not latency evidence.
+	ExpiryMeasurement string `json:"expiry_measurement,omitempty"`
 }
 
 // writePerfRecord creates path with O_EXCL: baseline evidence is written
@@ -452,28 +457,30 @@ func runExpiryScenario(t *testing.T, base perfRecord, spread time.Duration, with
 	}
 	before := Lives()
 
-	// Latency run: no snapshots inside the measurement.
-	m, startAt := prepareRealExpiryCache(t, expiredCount, liveCount, spread)
-	latency := runLoadOnceAt(t, cfg, startAt, cacheActionOp(m, actions))
+	var latency loadResult
+	if *perfExpiryMeasure != "reclaim" {
+		// Latency run: no snapshots inside the measurement.
+		m, startAt := prepareRealExpiryCache(t, expiredCount, liveCount, spread)
+		latency = runLoadOnceAt(t, cfg, startAt, cacheActionOp(m, actions))
+	}
 
-	// Monitor run: separate fixture and load; pure snapshots only. The
-	// reclaim bound covers the 3s load window plus the spread window and
-	// several cleaner ticks with margin.
-	monitor, monitorStart := prepareRealExpiryCache(t, expiredCount, liveCount, spread)
-	monitorDone := make(chan loadResult, 1)
-	monitorFailed := false
-	go func() {
-		result, err := runLoadChecked(cfg, monitorStart, cacheActionOp(monitor, actions))
-		if err != nil {
-			t.Errorf("monitor run: %v", err)
-			monitorFailed = true
+	var reclaim time.Duration
+	var reclaimed bool
+	if *perfExpiryMeasure != "latency" {
+		// Monitor run: separate fixture and load; pure snapshots only. Keep
+		// the original monitor and bound for comparable full-suite evidence.
+		monitor, monitorStart := prepareRealExpiryCache(t, expiredCount, liveCount, spread)
+		monitorDone := make(chan error, 1)
+		go func() {
+			_, err := runLoadChecked(cfg, monitorStart, cacheActionOp(monitor, actions))
+			monitorDone <- err
+		}()
+		reclaim, reclaimed = waitExpiryReclaimed(monitor, monitorStart, 10*time.Second)
+		if err := <-monitorDone; err != nil {
+			t.Fatalf("monitor run: %v", err)
 		}
-		monitorDone <- result
-	}()
-	reclaim, reclaimed := waitExpiryReclaimed(monitor, monitorStart, 10*time.Second)
-	if result := <-monitorDone; !monitorFailed {
-		if err := verifyLoadAccounting(result, false); err != nil {
-			t.Errorf("monitor run: %v", err)
+		if !reclaimed {
+			t.Logf("reclaim did not finish within the bounded wait; reclaim_duration_ns omitted")
 		}
 	}
 
@@ -484,14 +491,15 @@ func runExpiryScenario(t *testing.T, base perfRecord, spread time.Duration, with
 	base.ValueType = "int"
 	base.WorkloadSHA256 = actionsSHA256(actions)
 	base.Load = latency
+	if *perfExpiryMeasure != "both" {
+		base.ExpiryMeasurement = *perfExpiryMeasure
+	}
 	resources := map[string]uint64{
 		"goroutines":        uint64(runtime.NumGoroutine()),
 		"registered_caches": uint64(Lives() - before),
 	}
 	if reclaimed {
 		resources["reclaim_duration_ns"] = uint64(reclaim.Nanoseconds())
-	} else {
-		t.Logf("reclaim did not finish within the bounded wait; reclaim_duration_ns omitted")
 	}
 	base.Resources = resources
 	return base
@@ -505,6 +513,14 @@ func TestCachePerformance(t *testing.T) {
 	}
 	if *perfOut == "" {
 		t.Fatal("-cache-perf-out is required together with -cache-perf-case")
+	}
+	switch *perfExpiryMeasure {
+	case "both", "latency", "reclaim":
+	default:
+		t.Fatalf("unknown -cache-perf-expiry-measure %q", *perfExpiryMeasure)
+	}
+	if *perfExpiryMeasure != "both" && *perfCase != "expiry-burst" && *perfCase != "expiry-spread" && *perfCase != "size-burst" {
+		t.Fatal("-cache-perf-expiry-measure applies only to expiry-burst, expiry-spread, and size-burst")
 	}
 	base := perfRecord{
 		Schema:     1,

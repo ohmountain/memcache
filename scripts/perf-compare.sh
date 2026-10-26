@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/perf-compare.sh --control <commit> --candidate <commit> \
 #     --harness <commit> --comparison-role original|incremental \
-#     --suite smoke|full --out <new-dir>
+#     --suite smoke|quick|full --out <new-dir>
 #
 # The measurement contract is strategy-neutral and closed:
 #   * Runtime source (every root *.go that is not a _test.go file, plus go.mod)
@@ -22,6 +22,7 @@
 #     only; the manifest says so and such a run must not be reported as a
 #     Stage B acceptance result.
 #   * --suite smoke only proves the pipeline. It is not acceptance evidence.
+#     --suite quick measures three development pairs with expiry latency only.
 #     --suite full collects the Stage A matrix; repeated measurements run as
 #     10 interleaved control/candidate pairs, one subprocess each, never
 #     concurrently.
@@ -95,9 +96,12 @@ case "$role" in
   *) die "--comparison-role must be original or incremental, got '$role'" ;;
 esac
 case "$suite" in
-  smoke | full) ;;
-  *) die "--suite must be smoke or full, got '$suite'" ;;
+  smoke | quick | full) ;;
+  *) die "--suite must be smoke, quick, or full, got '$suite'" ;;
 esac
+if [ "$suite" = quick ]; then
+  REPETITIONS=3
+fi
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
@@ -180,10 +184,15 @@ cp "$candidate_src"/*.go "$candidate_src/go.mod" "$scratch/candidate/"
 
 record "suite=$suite"
 record "comparison_role=$role"
-case "$role" in
-  original) record "stage_b_conclusion=eligible (control is the frozen Stage A runtime)" ;;
-  incremental) record "stage_b_conclusion=attribution-only; not a Stage B acceptance verdict" ;;
-esac
+if [ "$suite" = quick ]; then
+  record "stage_b_conclusion=development-only; not a Stage B acceptance verdict"
+  record "acceptance_evidence=no"
+else
+  case "$role" in
+    original) record "stage_b_conclusion=eligible (control is the frozen Stage A runtime)" ;;
+    incremental) record "stage_b_conclusion=attribution-only; not a Stage B acceptance verdict" ;;
+  esac
+fi
 record "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 record "control_commit=$control_sha"
 record "candidate_commit=$candidate_sha"
@@ -192,7 +201,11 @@ record "original_runtime=$ORIGINAL_RUNTIME"
 record "seed=$SEED"
 record "repetitions=$REPETITIONS"
 record "interleave=AB/BA rotation; control and candidate never run concurrently"
-record "idle_lifecycle_samples=single pair (Stage A sampled these once; not percentage-verdict inputs)"
+if [ "$suite" = quick ]; then
+  record "quick_note=latency only; idle, lifecycle, large tiers, and profiles omitted"
+else
+  record "idle_lifecycle_samples=single pair (Stage A sampled these once; not percentage-verdict inputs)"
+fi
 record "git_head=$(git rev-parse HEAD)"
 record "git_dirty=$(if git diff --quiet && git diff --cached --quiet; then echo no; else echo yes; fi)"
 record "go_version=$(go version)"
@@ -313,15 +326,40 @@ perf_json() { printf '%s/%s/%s.json\n' "$results" "$1" "$2"; }
 
 run_perf_case() {
   local side="$1" case_name="$2" rate="$3" label="$4" rep="$5"
-  local json
+  local json duration=3s
+  local expiry_args=()
+  if [ "$suite" = quick ]; then
+    duration=1s
+    if [ "$case_name" = expiry-burst ]; then
+      expiry_args=(-cache-perf-expiry-measure=latency)
+    fi
+  fi
   json="$(perf_json "$side" "${label}-rep${rep}")"
   run_logged "${label}-rep${rep}-${side}" "$scratch/$side" \
     go test -run '^TestCachePerformance$' -count=1 -timeout=10m . -args \
-    -cache-perf-case="$case_name" -cache-perf-rate="$rate" -cache-perf-duration=3s \
-    -cache-perf-workers=4 -cache-perf-queue=1024 -cache-perf-out="$json"
+    -cache-perf-case="$case_name" -cache-perf-rate="$rate" -cache-perf-duration="$duration" \
+    -cache-perf-workers=4 -cache-perf-queue=1024 "${expiry_args[@]}" -cache-perf-out="$json"
 }
 
 case "$suite" in
+  quick)
+    run_pair bench-quick \
+      go test -run='^$' -bench='^BenchmarkCache$' -benchmem -benchtime=100ms -count=1 -timeout=5m . -- \
+      go test -run='^$' -bench='^BenchmarkCache$' -benchmem -benchtime=100ms -count=1 -timeout=5m .
+    for case_name in noop steady expiry-burst; do
+      label="perf-${case_name}-rate10000"
+      for pair in $(seq 1 "$REPETITIONS"); do
+        rep="$(printf '%02d' "$pair")"
+        if [ $((pair % 2)) -eq 1 ]; then
+          run_perf_case control "$case_name" 10000 "$label" "$rep"
+          run_perf_case candidate "$case_name" 10000 "$label" "$rep"
+        else
+          run_perf_case candidate "$case_name" 10000 "$label" "$rep"
+          run_perf_case control "$case_name" 10000 "$label" "$rep"
+        fi
+      done
+    done
+    ;;
   smoke)
     record "smoke_note=pipeline only; never use these numbers for percentage acceptance"
     run_pair_once bench-smoke \

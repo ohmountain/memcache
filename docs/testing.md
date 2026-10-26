@@ -80,9 +80,27 @@ go-test commands from docs/performance/README.md) collects the whole bundle:
 
 ```sh
 make perf-baseline PERFSUITE=smoke            # pipeline check, NOT a baseline
+make perf-quick                               # current runtime, short latency matrix
 make perf-baseline                            # full formal collection
 make perf-baseline PERFSUITE=full PERFOUT=/tmp/memcache-perf-002
 ```
+
+Expiry scenarios also accept `-cache-perf-expiry-measure=latency` or
+`reclaim` to run only one measurement; the default `both` keeps the original
+two-fixture measurement. See [performance modes](performance/README.md).
+
+The performance CLI and quick collection scripts have a separate integration
+check using Python 3's standard library and real Go subprocesses:
+
+```sh
+python3 scripts/test-perf.py
+```
+
+It checks all expiry measurement modes, quick JSON accounting, refusal to
+overwrite evidence, and the three AB/BA comparison pairs in a temporary git
+repository. It does not alter the developer's commits or refs and is kept
+outside ordinary `go test` so routine correctness checks do not run stress
+collection.
 
 To replay a recorded history or model failure, rerun with `-run` naming the
 failing test and the seed or shuffle seed Go printed; scenario JSON records

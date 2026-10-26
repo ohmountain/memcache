@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Collect the reproducible memcache performance baseline.
 #
-# Usage: scripts/perf-baseline.sh [--suite smoke|full] [--out PATH]
+# Usage: scripts/perf-baseline.sh [--suite smoke|quick|full] [--out PATH]
 #
 # The output directory must not exist; evidence is never overwritten. Without
 # --out a fresh mktemp directory outside the repository is used. --suite smoke
-# verifies the pipeline only and is NOT a baseline; --suite full collects the
-# repeated measurements (micro benchmarks x10, first-expiry operations x10,
+# verifies the pipeline only; --suite quick measures the working-tree runtime
+# with a small latency-only matrix. Neither is a formal baseline. --suite full
+# collects repeated measurements (micro benchmarks x10, first-expiry operations x10,
 # five load scenarios x three rates x ten repetitions, idle instance counts,
 # lifecycle value types, and separate-process profiles) that the formal
 # baseline report freezes. Only local collection happens here: nothing is
@@ -37,9 +38,9 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$suite" in
-  smoke | full) ;;
+  smoke | quick | full) ;;
   *)
-    echo "--suite must be smoke or full" >&2
+    echo "--suite must be smoke, quick, or full" >&2
     exit 2
     ;;
 esac
@@ -49,7 +50,11 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 # Verify the runtime files BEFORE creating anything, so a refused run leaves
 # no output directory behind to block a retry with the same --out.
 cd "$repo_root"
+runtime_matches_baseline=yes
 if ! git diff --quiet "$RUNTIME_BASELINE" -- "${RUNTIME_FILES[@]}"; then
+  runtime_matches_baseline=no
+fi
+if [ "$suite" != quick ] && [ "$runtime_matches_baseline" != yes ]; then
   echo "runtime files differ from baseline $RUNTIME_BASELINE; refusing to measure" >&2
   git diff "$RUNTIME_BASELINE" -- "${RUNTIME_FILES[@]}" >&2 || true
   exit 1
@@ -75,7 +80,12 @@ record "suite=$suite"
 record "started_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 record "git_head=$(git rev-parse HEAD)"
 record "runtime_baseline=$RUNTIME_BASELINE"
-record "runtime_files_match_baseline=yes"
+record "runtime_files_match_baseline=$runtime_matches_baseline"
+if [ "$suite" = quick ]; then
+  record "acceptance_evidence=no"
+  record "repetitions=3"
+  record "quick_note=working-tree development measurements; expiry latency only; no profiles"
+fi
 record "git_dirty=$(if git diff --quiet && git diff --cached --quiet; then echo no; else echo yes; fi)"
 record "seed=$SEED"
 record "go_version=$(go version)"
@@ -123,6 +133,22 @@ task_perf_dir="$out/perf"
 mkdir -p "$task_perf_dir"
 
 case "$suite" in
+  quick)
+    run_logged bench-quick go test -run='^$' -bench='^BenchmarkCache$' -benchmem -benchtime=100ms -count=3 -timeout=5m .
+    for case_name in noop steady expiry-burst; do
+      expiry_args=()
+      if [ "$case_name" = expiry-burst ]; then
+        expiry_args=(-cache-perf-expiry-measure=latency)
+      fi
+      for rep in 1 2 3; do
+        label="perf-${case_name}-rate10000-rep$(printf '%02d' "$rep")"
+        run_logged "$label" go test -run '^TestCachePerformance$' -count=1 -timeout=2m . -args \
+          -cache-perf-case="$case_name" -cache-perf-rate=10000 -cache-perf-duration=1s \
+          -cache-perf-workers=4 -cache-perf-queue=1024 "${expiry_args[@]}" \
+          -cache-perf-out="$task_perf_dir/${label}.json"
+      done
+    done
+    ;;
   smoke)
     run_logged bench-smoke go test -run='^$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload)$' -benchmem -benchtime=200ms -count=1 -timeout=10m ./...
     run_logged perf-smoke go test -run '^TestCachePerformance$' -count=1 -timeout=5m . -args -cache-perf-case=noop -cache-perf-rate=1000 -cache-perf-duration=1s -cache-perf-out="$task_perf_dir/smoke-noop-001.json"

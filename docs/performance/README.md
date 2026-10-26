@@ -9,16 +9,22 @@ machine, Go version, and CPU configuration.
 ## How to collect
 
 ```sh
+make perf-quick                     # short working-tree measurements for development
 make perf-baseline PERFSUITE=smoke   # verifies the pipeline only; NOT a baseline
 make perf-baseline                   # full formal collection into a fresh directory
 ```
 
 `scripts/perf-baseline.sh` refuses to write into an existing `--out`
-directory, verifies the runtime files still match the frozen runtime
-baseline commit (`12698ab…`), runs everything serially, and writes every
+directory, runs everything serially, and writes every
 command, its log, and a SHA256SUMS inventory into a `manifest.txt`. On
 Windows run the equivalent `go test` commands listed in the script's `full`
 section directly.
+
+`smoke` and `full` verify that the runtime files still match the frozen
+runtime baseline commit (`12698ab…`). `quick` measures the current working
+tree, including modified runtime files, and records whether they match the
+baseline. Its manifest carries `acceptance_evidence=no`: the reduced matrix
+is for development feedback, not a formal baseline or acceptance verdict.
 
 Layered entries:
 
@@ -27,7 +33,37 @@ Layered entries:
 | `make bench` | Ordinary 1K-key micro benchmarks once (200ms each) |
 | `make bench-full` | Same benchmarks plus 100K/1M scenarios (`-cache-perf-full=true`), 10 repetitions, `-cpu=1,2,4,8` |
 | `make bench-expiry` | First Set/Lookup/Size after a full-cache expiry event, one operation per fresh fixture (`-benchtime=1x`), 10 repetitions |
-| `make perf-baseline` | Everything above plus the open-loop scenarios, idle/lifecycle runs, and profiles |
+| `make perf-quick` | `BenchmarkCache` at the runtime-default CPU count, 100ms × 3; noop/steady/expiry-burst at 10K rps, 1s × 3; expiry latency only, no profiles |
+| `make perf-baseline` | Full micro and expiry benchmark matrix plus open-loop scenarios, idle/lifecycle runs, and profiles |
+
+`make perf-baseline PERFSUITE=quick` is equivalent to `make perf-quick`.
+Both accept `PERFOUT=/tmp/<new-directory>`. A quick expiry sample still
+preloads 100000 expiring entries and waits about one second for the first
+deadline before its one-second load window.
+
+### Measure expiry latency or reclamation independently
+
+For `expiry-burst`, `expiry-spread`, and `size-burst`, select the measurement
+with `-cache-perf-expiry-measure`:
+
+| Value | Work performed | JSON evidence |
+| --- | --- | --- |
+| `both` (default) | Original independent latency run, then a separate monitor run | `load` contains unmonitored latency; `resources.reclaim_duration_ns` contains successful reclamation time |
+| `latency` | One fixture and load, without the monitor run | `expiry_measurement="latency"`; no reclamation metric |
+| `reclaim` | One monitor fixture and load, without the independent latency run | `expiry_measurement="reclaim"`; successful reclamation metric; `load` is all zero because monitor latencies are not latency evidence |
+
+For example, collect just reclamation under the standard 3s load:
+
+```sh
+go test -run '^TestCachePerformance$' -count=1 -timeout=60s . -args \
+  -cache-perf-case=expiry-burst -cache-perf-expiry-measure=reclaim \
+  -cache-perf-out=/tmp/memcache-reclaim-001.json
+```
+
+Choose a fresh output path on each run. The non-default measurement values are
+rejected for other scenarios. With `both`, the existing schema-1 JSON stays
+unchanged (`expiry_measurement` is omitted), and the original snapshot-based
+monitor, fixture sizes, and load configuration are retained.
 
 ## Comparing a candidate against a control
 
@@ -70,6 +106,13 @@ make perf-compare \
   interleaved control/candidate pairs (AB/BA rotation), one subprocess per
   sample. Control and candidate never run concurrently. Idle and lifecycle
   scenarios run once per side, matching Stage A's cadence.
+- `PERFSUITE=quick` runs `BenchmarkCache` at the runtime-default CPU count
+  for 100ms and noop/steady/expiry-burst at 10K rps for 1s, as three serial
+  AB/BA pairs. Expiry uses `latency` only; large tiers, idle, lifecycle, and
+  profiles are omitted. Each side produces nine load JSON records. The
+  manifest marks `acceptance_evidence=no` regardless of comparison role.
+  Use a harness commit containing `-cache-perf-expiry-measure`; the script
+  still exports all sources from the specified commits, never the working tree.
 - Each sample keeps its exact command, exit code, and log; `manifest.txt` records
   the three full SHAs, per-file runtime and harness checksums, the environment,
   and the SHA256 of every exported file and scenario JSON. Each JSON's workload
@@ -87,6 +130,12 @@ GOMAXPROCS), the fixed seed (20261025), the complete `loadConfig`, the
 workload summary and the SHA256 of the actually replayed action sequence,
 the full `loadResult`, and a `resources` map. Durations are encoded as
 integer nanoseconds throughout.
+
+`expiry_measurement` is an optional schema-1 field for latency-only or
+reclamation-only expiry runs (see the mode table above). An omitted field
+on an expiry record means the original `both` measurement. Reclamation-only
+records have no latency measurement; their zero `load` must not be treated
+as a measured zero latency or throughput.
 
 `loadResult` satisfies fixed accounting equations — check any file against
 them before trusting it:

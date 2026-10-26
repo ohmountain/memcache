@@ -4,7 +4,7 @@ FUZZWORKERS ?= 4
 PERFSUITE ?= full
 PERFROLE ?= original
 
-.PHONY: check fmt-check vet test race coverage fuzz bench bench-full bench-expiry perf-baseline perf-compare
+.PHONY: check fmt-check vet test race coverage fuzz bench bench-full bench-expiry perf-quick perf-baseline perf-compare
 
 check: fmt-check vet test race
 
@@ -40,6 +40,10 @@ bench-full:
 # adaptive b.N loop would refill 100K/1M caches, so it requires -benchtime=1x.
 bench-expiry:
 	$(GO) test -run='^$$' -bench='^BenchmarkCacheExpiry$$' -benchmem -benchtime=1x -count=10 -timeout=10m ./... -args -cache-perf-full=true
+
+# perf-quick measures the working tree with a short latency-only matrix.
+perf-quick:
+	bash scripts/perf-baseline.sh --suite quick $(if $(PERFOUT),--out "$(PERFOUT)",)
 
 # perf-baseline collects the staged evidence bundle into a fresh directory;
 # smoke verifies the pipeline, full freezes the repeated formal baseline.
