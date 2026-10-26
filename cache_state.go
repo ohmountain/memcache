@@ -32,7 +32,12 @@ type shard[T CacheAble] struct {
 	head, tail *node[T]
 	heap       expiryHeap[T]
 	free       []*node[T]
-	size       int // mirrors len(m); cached because the full-shard check runs on every insert
+	// size mirrors len(m); cached because the full-shard check runs on every
+	// insert. Writers update it under mu with an atomic store (a plain MOV on
+	// amd64/arm64), so Len can sum atomic loads without taking shard locks.
+	// uint32 keeps the counter naturally aligned on every platform and bounds
+	// the design to caches far below 4 billion entries per shard.
+	size uint32
 	// nowSample is the newest clock reading any holder of mu has published,
 	// for Options.ApproximateTTLReads. It is a lower bound of the real clock,
 	// so deadline <= nowSample proves expiry while deadline > nowSample only
@@ -395,7 +400,7 @@ func (s *shard[T]) removeLocked(n *node[T]) {
 	n.heapGen++
 	s.unlink(n)
 	delete(s.m, n.key)
-	s.size--
+	s.setSizeLocked(int(atomic.LoadUint32(&s.size)) - 1)
 	s.release(n)
 	if len(s.heap) == 0 && cap(s.heap) > maxIdleHeapCap {
 		s.heap = nil
@@ -455,7 +460,14 @@ func (s *shard[T]) clearLocked() {
 	s.heap = nil
 	s.heapLive = 0
 	s.free = nil
-	s.size = 0
+	atomic.StoreUint32(&s.size, 0)
+}
+
+// setSizeLocked records the shard's entry count under mu. Every access to
+// size is atomic: the lock-free Len loads it concurrently, and mixing a plain
+// write with an atomic read of one address is a race even under this lock.
+func (s *shard[T]) setSizeLocked(n int) {
+	atomic.StoreUint32(&s.size, uint32(n))
 }
 
 // rootDeadline is the earliest live deadline in this shard (zero when none).
@@ -525,7 +537,7 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 
 	// One set of predicates serves the clock read, the root tracking, and the
 	// reclaim step, so a full-shard insert does not re-evaluate them.
-	reclaim := !ok && sh.size >= sh.cap
+	reclaim := !ok && int(atomic.LoadUint32(&sh.size)) >= sh.cap
 	// The heap is touched when this write adds a deadline, cancels one, or
 	// reclaims a due root from a full shard.
 	touchesHeap := expiring || oldDeadline != 0 || (reclaim && len(sh.heap) > 0)
@@ -583,7 +595,7 @@ func (s *cacheState[T]) set(key string, value T, ttlNanos int64, expiring bool) 
 			sh.m = make(map[string]*node[T])
 		}
 		sh.m[key] = n
-		sh.size++
+		sh.setSizeLocked(int(atomic.LoadUint32(&sh.size)) + 1)
 	}
 
 	// A deadline change bumps the generation (cancelling any earlier record)
@@ -756,7 +768,7 @@ func (s *cacheState[T]) Size() uint {
 			if removed > 0 {
 				purged = true
 			}
-			size := sh.size
+			size := int(atomic.LoadUint32(&sh.size))
 			sh.mu.Unlock()
 			if removed < sizePurgeBatch {
 				total += size
@@ -770,16 +782,17 @@ func (s *cacheState[T]) Size() uint {
 	return uint(total)
 }
 
-// Len returns the physical entry count without purging expired entries.
+// Len returns the physical entry count without purging expired entries. It
+// reads each shard's published size atomically, so it never takes a shard
+// lock; a concurrent Clear or Close may briefly leave stale counts in the
+// sum, and a quiescent read is exact.
 func (s *cacheState[T]) Len() uint {
 	if s.capacity == 0 || s.isClosed() {
 		return 0
 	}
 	total := 0
 	for _, sh := range s.shards {
-		sh.mu.Lock()
-		total += sh.size
-		sh.mu.Unlock()
+		total += int(atomic.LoadUint32(&sh.size))
 	}
 	return uint(total)
 }
@@ -884,7 +897,7 @@ func (s *cacheState[T]) stats() Stats {
 	stats := Stats{Capacity: s.capacity}
 	for _, sh := range s.shards {
 		sh.mu.Lock()
-		stats.Entries += uint(sh.size)
+		stats.Entries += uint(atomic.LoadUint32(&sh.size))
 		stats.Hits += sh.hits
 		stats.Misses += sh.misses
 		stats.Sets += sh.sets

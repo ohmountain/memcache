@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"reflect"
+	"sync/atomic"
 	"testing"
 )
 
@@ -11,11 +12,12 @@ func assertInvariants(t testing.TB, m *Memcache[int]) {
 	total := 0
 	for _, sh := range s.shards {
 		sh.mu.Lock()
-		if sh.size != len(sh.m) || sh.size > sh.cap {
+		size := int(atomic.LoadUint32(&sh.size))
+		if size != len(sh.m) || size > sh.cap {
 			sh.mu.Unlock()
-			t.Fatalf("inconsistent shard size: map=%d size=%d cap=%d", len(sh.m), sh.size, sh.cap)
+			t.Fatalf("inconsistent shard size: map=%d size=%d cap=%d", len(sh.m), size, sh.cap)
 		}
-		total += sh.size
+		total += size
 		// Heap pass first: order by the record's own deadline snapshot, plus
 		// a live-record census used by the list walk below. A record is live
 		// iff its generation still matches its node; stale records may linger
