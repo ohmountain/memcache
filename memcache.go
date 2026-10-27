@@ -2,42 +2,131 @@
 package memcache
 
 import (
-	"container/list"
 	"runtime"
 	"time"
 )
 
-// Memcache is a concurrent LRU cache. Construct it with WithLRU; its zero value
-// is not initialized. Do not copy a Memcache. Call Close when it is no longer
-// needed to synchronously release its contents, registration, and cleaner.
+// Memcache is a concurrent LRU cache. Construct it with WithLRU or WithOptions;
+// its zero value is not initialized. Do not copy a Memcache. Call Close when it
+// is no longer needed to synchronously release its contents, registration, and
+// cleaner.
 type Memcache[T CacheAble] struct {
 	state *cacheState[T]
 }
 
+// Options configures WithOptions. Capacity is the maximum number of entries
+// (zero stores nothing). EnableExpired enables TTLs and background cleanup.
+// Shards zero or one keeps one exact global LRU; a value above one opts into
+// approximate per-shard LRU for multi-core throughput. The shard count is
+// rounded down to a power of two and capped at Capacity/ShardSlots so no shard
+// is sized below about ShardSlots slots; Capacity is split evenly across the
+// result. No process signal handlers are installed.
+type Options struct {
+	Capacity      uint
+	EnableExpired bool
+	Shards        int
+	// ShardSlots is the approximate minimum number of entries per shard when
+	// sharding; zero or negative selects the default of 64. Lowering it lets
+	// a small cache use more shards (for example 1024 entries across 64
+	// shards at 16 slots), which raises multicore throughput on small
+	// resident sets but makes approximate LRU coarser: with the default, a
+	// uniform working set loses under 2% hit rate at 16 shards, and more
+	// shards lose more. It has no effect on a single-shard cache.
+	ShardSlots int
+	// Preallocate reserves map buckets for each shard up front. It trades
+	// memory for fewer growth stalls; leave it off for many small or mostly
+	// empty caches.
+	Preallocate bool
+	// DisableStats turns off the hit/miss/set/delete/eviction/expiration
+	// counters. Stats then reports only Capacity and Entries. Each counter
+	// update is a store to a shard cache line that a read-only path such as
+	// Peek otherwise never dirties, so disabling them raises multicore read
+	// throughput; do it when the counters are not exported.
+	DisableStats bool
+	// ApproximateTTLReads trades deadline exactness for read speed. When it
+	// is false (the default), every Lookup and Peek of an entry with a TTL
+	// reads the clock and an already-expired entry misses immediately. When
+	// it is true, reads compare the deadline against the shard's last
+	// observed clock sample instead, skipping that clock read; an entry that
+	// expired after the last observation is therefore served as a hit for up
+	// to one observation window. Every TTL write, every cleaner round, and
+	// Size publish fresh samples, so in write-active or cleaner-active
+	// shards the window stays bounded by that activity.
+	ApproximateTTLReads bool
+}
+
+// Stats is a point-in-time snapshot of cache counters. Entries is physical
+// (Len semantics) and does not purge expired entries. Hits and Misses count
+// Lookup and Get; Peek traffic is reported separately by Peeks and PeekHits.
+// With Options.DisableStats every field except Capacity and Entries stays zero.
+type Stats struct {
+	Capacity    uint
+	Entries     uint
+	Hits        uint64
+	Misses      uint64
+	Sets        uint64
+	Deletes     uint64
+	Evictions   uint64
+	Expirations uint64
+	Peeks       uint64
+	PeekHits    uint64
+}
+
+// cleanerMode selects how the background worker starts. It replaces the old
+// adjacent (startCleaner, autoStart) booleans, whose false/true combinations
+// were easy to swap at call sites.
+type cleanerMode uint8
+
+const (
+	cleanerNone cleanerMode = iota
+	cleanerEager
+	cleanerLazy
+)
+
 // WithLRU creates a cache holding at most capacity items. Zero capacity disables
-// storage. enableExpired enables TTLs and a background cleaner. No process
-// signal handlers are installed.
+// storage. enableExpired enables TTLs and a background cleaner. The default is
+// one exact global LRU; use WithOptions to opt into sharding.
 func WithLRU[T CacheAble](capacity uint, enableExpired bool) *Memcache[T] {
-	return newMemcache[T](capacity, enableExpired, time.Now, true)
+	return WithOptions[T](Options{Capacity: capacity, EnableExpired: enableExpired})
+}
+
+// WithOptions creates a cache from an Options value. The background cleaner is
+// started on the first TTL write, so a TTL-enabled cache that never stores a
+// TTL holds no worker goroutine.
+func WithOptions[T CacheAble](opts Options) *Memcache[T] {
+	return newMemcacheConfigured[T](opts, productionClock, cleanerLazy)
 }
 
 // The clock and cleaner switch allow deterministic TTL tests without sleeps.
+// An injected clock carries no monotonic reading, so systemClock keeps the
+// portable Now().Sub(start) path for it.
 func newMemcache[T CacheAble](capacity uint, enableExpired bool, now func() time.Time, startCleaner bool) *Memcache[T] {
-	s := &cacheState[T]{
-		capacity:      capacity,
-		holder:        make(map[string]*node[T]),
-		order:         list.New(),
-		enableExpired: enableExpired,
-		now:           now,
-		done:          make(chan struct{}),
-		stopped:       make(chan struct{}),
+	mode := cleanerNone
+	if startCleaner {
+		mode = cleanerEager
 	}
+	return newMemcacheConfigured[T](Options{Capacity: capacity, EnableExpired: enableExpired}, systemClock{now: now}, mode)
+}
+
+func newMemcacheConfigured[T CacheAble](opts Options, clock cacheClock, mode cleanerMode) *Memcache[T] {
+	m := newMemcacheWithClockShards[T](opts.Capacity, opts.EnableExpired, clock, mode == cleanerEager, opts.Shards, opts.ShardSlots, opts.Preallocate, !opts.DisableStats, opts.ApproximateTTLReads)
+	m.state.autoStart = mode == cleanerLazy
+	return m
+}
+
+// newMemcacheWithClock is the single-shard test seam: the injected clock
+// supplies both deadline reads and cleaner scheduling.
+func newMemcacheWithClock[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool) *Memcache[T] {
+	return newMemcacheWithClockShards[T](capacity, enableExpired, clock, startCleaner, 1, shardSlotTarget, false, true, false)
+}
+
+func newMemcacheWithClockShards[T CacheAble](capacity uint, enableExpired bool, clock cacheClock, startCleaner bool, shards int, slotTarget int, preallocate bool, collectStats bool, approxReads bool) *Memcache[T] {
+	s := newCacheState[T](capacity, enableExpired, clock, shards, slotTarget, preallocate, collectStats, approxReads)
 	m := &Memcache[T]{state: s}
 	lives.add(s)
+
 	if enableExpired && capacity > 0 && startCleaner {
-		go s.runCleaner()
-	} else {
-		close(s.stopped)
+		s.startWorkerNow()
 	}
 	// Registry entries and the cleaner refer only to state, so an abandoned
 	// public handle can be collected. Finalization is a best-effort fallback;
@@ -56,7 +145,23 @@ func (m *Memcache[T]) Set(key string, value T) {
 // expiration disabled it behaves like Set. Otherwise a nonpositive TTL deletes
 // the key immediately. TTLs exceeding time.Duration's range are clamped.
 func (m *Memcache[T]) SetExpire(key string, value T, ttl int64) {
-	m.state.set(key, value, ttl, true)
+	if ttl <= 0 {
+		m.state.set(key, value, 0, true)
+		runtime.KeepAlive(m)
+		return
+	}
+	if ttl > maxTTLSeconds {
+		ttl = maxTTLSeconds
+	}
+	m.state.set(key, value, ttl*int64(time.Second), true)
+	runtime.KeepAlive(m)
+}
+
+// SetExpireDuration is SetExpire with sub-second precision. A nonpositive
+// duration deletes the key when TTLs are enabled; excessive durations are
+// clamped to the maximum time.Duration.
+func (m *Memcache[T]) SetExpireDuration(key string, value T, ttl time.Duration) {
+	m.state.set(key, value, int64(ttl), true)
 	runtime.KeepAlive(m)
 }
 
@@ -72,11 +177,35 @@ func (m *Memcache[T]) Get(key string) *T {
 	return &value
 }
 
+// GetInto writes a shallow value copy into dst on a hit and reports whether
+// the key was present and live; on a miss dst is left untouched. It has the
+// same recency and expiry semantics as Lookup and, unlike Get, allocates
+// nothing. A nil dst panics on a hit.
+func (m *Memcache[T]) GetInto(key string, dst *T) bool {
+	value, ok := m.state.lookup(key)
+	runtime.KeepAlive(m)
+	if !ok {
+		return false
+	}
+	*dst = value
+	return true
+}
+
 // Lookup returns a shallow value copy and whether the key is present and live.
 // Successful reads refresh the LRU order.
 func (m *Memcache[T]) Lookup(key string) (T, bool) {
 	value, ok := m.state.lookup(key)
 	// Prevent finalization from closing state while an operation is in flight.
+	runtime.KeepAlive(m)
+	return value, ok
+}
+
+// Peek returns a shallow value copy without refreshing LRU order. It is the
+// read path for multi-core workloads that can accept approximate recency:
+// expired entries still miss, but are left for the cleaner. Peeks are counted
+// separately in Stats.
+func (m *Memcache[T]) Peek(key string) (T, bool) {
+	value, ok := m.state.peek(key)
 	runtime.KeepAlive(m)
 	return value, ok
 }
@@ -87,11 +216,24 @@ func (m *Memcache[T]) Delete(key string) {
 	runtime.KeepAlive(m)
 }
 
-// Size returns the number of live entries, purging any expired entries first.
+// Size returns the number of live entries, purging expired entries first. It
+// purges in bounded chunks across shards so a large sweep does not hold one
+// lock for its entire duration. Use Len for an O(1)-per-shard physical count.
 func (m *Memcache[T]) Size() uint {
 	size := m.state.Size()
 	runtime.KeepAlive(m)
 	return size
+}
+
+// Len returns the physical entry count without purging expired entries. It
+// never reads the clock and is suitable for monitoring. It is lock-free: it
+// reads each shard's published size atomically without taking a shard lock,
+// so a concurrent Clear or Close may briefly leave stale counts in the sum;
+// a quiescent read is exact.
+func (m *Memcache[T]) Len() uint {
+	n := m.state.Len()
+	runtime.KeepAlive(m)
+	return n
 }
 
 // Cap returns the configured maximum number of entries, even after Close.
@@ -99,6 +241,13 @@ func (m *Memcache[T]) Cap() uint {
 	capacity := m.state.Cap()
 	runtime.KeepAlive(m)
 	return capacity
+}
+
+// Stats returns a point-in-time snapshot of this cache's counters.
+func (m *Memcache[T]) Stats() Stats {
+	stats := m.state.stats()
+	runtime.KeepAlive(m)
+	return stats
 }
 
 // Clear removes all entries and expiration records, keeping the cache usable.
@@ -113,10 +262,5 @@ func (m *Memcache[T]) Clear() {
 func (m *Memcache[T]) Close() {
 	m.state.close()
 	runtime.SetFinalizer(m, nil)
-	runtime.KeepAlive(m)
-}
-
-func (m *Memcache[T]) checkExpired() {
-	m.state.checkExpired()
 	runtime.KeepAlive(m)
 }

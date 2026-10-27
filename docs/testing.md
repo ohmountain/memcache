@@ -10,19 +10,39 @@ race detector, coverage instrumentation, built-in fuzzing, and benchmarks.
 | `memcache_test.go` | Capacity, LRU read/update order, deleting every position, Clear/reuse, snapshots, zero and nil values |
 | `invariants_test.go` | Map/list agreement, capacity bound, heap ordering and indices, one expiry record per item |
 | `expiration_test.go` | Exact expiry boundaries, renewal/overwrite, delete/evict/clear then reinsert, TTL bounds, metadata retention |
+| `foreground_expiration_test.go` | B1 foreground bound: physical snapshots prove one-slot reclamation, target-only delete/update/reinsert, expired-before-live-LRU preference, and unchanged TTL-disabled/zero-capacity behavior |
+| `cleaner_clock_test.go` | Single-owner timer state machine: one `NewTimer`, armed/consumed/stopped transitions, Go 1.18 `Stop=false` drain before `Reset`, repeated stop, no blocking; synchronized fake clock and timer |
+| `cleaner_test.go` | Background scheduling: batch limit 64, empty-heap sleep with no timer or periodic clock read, deadline changes (earlier/extended/deleted/cancelled), coalesced wakes, stale event after `Clear`, `Close` between batches, disabled/zero-capacity, and the cleaner-versus-operation histories |
 | `lifecycle_test.go` | Close/unregister/join, global clear, collection of abandoned handles, real cleaner, process-signal isolation |
 | `concurrency_test.go` | Same-key deletion, mixed operations, concurrent Close/global clear/registration, snapshot stability |
-| `fuzz_test.go` | Values, misses, capacity, complete recency order, and internal invariants against an independent slice-based model |
+| `model_snapshot_test.go` | Lock-held snapshots that preserve expired physical entries, no aliasing, consistency under concurrent mutation |
+| `model_state_test.go` | Independent reference model (map + recency slice), TTL-disabled and post-Close contracts, boundary/clone self-tests, large deterministic sequences |
+| `fuzz_test.go` | Byte-encoded operations replayed against the model; observation uses snapshots only, so watching the cache never purges or refreshes |
+| `history_checker_test.go` | Bounded serial-order search honoring real time; impossible reads, budget exhaustion, malformed events, final-state matching |
+| `history_integration_test.go` | Recorded concurrent histories on a real cache replayed through the checker; renewal racing checkExpired |
+| `workload_test.go` | Deterministic read/write mixes (positional ratios), distribution validation, default-seed behavior |
+| `benchmark_*_test.go` | Named micro benchmarks: workloads, payloads, first post-expiry operation with `-benchtime=1x`, and the one-deadline expiry fixture test |
+| `performance_load_test.go` | Open-loop generator: nearest-rank quantiles, overload drop accounting, scheduler lag, cancellation join, Set-only latency |
+| `performance*_test.go` | Scenario evidence: JSON schema with O_EXCL writes, real expiry fixtures, instance/lifecycle resource rounds |
 | `example_test.go` | Executable public-package examples |
 | `benchmark_test.go` | Get/Lookup/update/TTL renewal and concurrent reads, with allocations reported |
 
 The deterministic TTL tests inject a clock and disable the real cleaner. They
 advance directly to deadlines, so a test does not pass merely because a long
-sleep eventually permits cleanup. Separate integration tests exercise the real
-cleaner and GC finalization with bounded five-second deadlines. Finalization
-timing is deliberately not part of the public contract; use Close in application
-code. The signal test sends SIGINT only to a dedicated child test process and is
-skipped on Windows/Plan 9.
+sleep eventually permits cleanup. The B2 scheduler tests inject both the clock
+and the timer: a mutex-protected fake records `NewTimer`/`Reset`/`Stop` calls,
+tests park the worker on channels or hooks at exact seams, and a two-second
+guard only catches a hung test. They assert that an empty heap creates no timer
+and reads no clock, that a coalesced wake cannot act on a stale deadline, and
+that a stale timer event arriving after `Clear` does not delete a rebuilt value.
+Separate integration tests exercise the real cleaner and GC finalization with
+bounded five-second deadlines. Finalization timing is deliberately not part of
+the public contract; use Close in application code. The signal test sends SIGINT
+only to a dedicated child test process and is skipped on Windows/Plan 9.
+
+The cleaner's `arm`/`stop` state machine must also run with the real Go 1.18
+timer semantics. `go test` under Go 1.18 is the evidence for that, not a
+`GODEBUG` switch on a newer toolchain and not cross-compilation.
 
 Tests close their own cache instances and do not depend on execution order. The
 global-monitor tests must not use `t.Parallel`, because `CLEAR_ALL` intentionally
@@ -30,15 +50,68 @@ acts on other registered caches in the same process.
 
 ## Commands
 
+Run `make check` after each code change. It includes `make lint` using
+golangci-lint v2.15.0 and the repository's `.golangci.yml`, including test files.
+See the [development setup](../README.md#development) for installation.
+`make lint-fix` applies supported fixes; review the changes and rerun the full
+check afterward. Lint failures must be resolved before submitting changes.
+
 ```sh
+golangci-lint run --config=.golangci.yml ./...
 go vet ./...
 go test -count=1 -timeout=60s ./...
 go test -race -shuffle=on -count=3 -timeout=120s ./...
 go test -count=1 -coverprofile=coverage.out ./...
 go tool cover -func=coverage.out
 go test -run='^$' -fuzz='^FuzzCacheModel$' -fuzztime=15s -parallel=4 .
-go test -run='^$' -bench=. -benchmem -benchtime=200ms ./...
+go test -run='^$' -bench='^(BenchmarkCache|BenchmarkCacheWorkload|BenchmarkCachePayload)$' -benchmem -benchtime=200ms ./...
 ```
+
+Benchmarks are layered: `make bench` runs the short 1K-key workloads;
+`make bench-full` adds the 100K/1M scenarios behind `-cache-perf-full=true`
+with ten repetitions across `-cpu=1,2,4,8`; `make bench-expiry` measures one
+post-expiry operation per fresh fixture and therefore requires
+`-benchtime=1x` — with an adaptive `b.N` it skips instead of refilling
+100K/1M caches repeatedly. `TestCachePerformance` skips under a plain
+`go test ./...`; the staged performance scenarios run explicitly:
+
+```sh
+go test -run='^TestCachePerformance$' -count=1 -timeout=60s . \
+  -args -cache-perf-case=expiry-burst -cache-perf-out=/tmp/new-evidence.json
+```
+
+The output file is created with O_EXCL: evidence is written once and never
+overwritten — pick a new path for every run instead of deleting old results.
+`scripts/perf-baseline.sh` (Linux/macOS; Windows uses the equivalent
+go-test commands from docs/performance/README.md) collects the whole bundle:
+
+```sh
+make perf-baseline PERFSUITE=smoke            # pipeline check, NOT a baseline
+make perf-quick                               # current runtime, short latency matrix
+make perf-baseline                            # full formal collection
+make perf-baseline PERFSUITE=full PERFOUT=/tmp/memcache-perf-002
+```
+
+Expiry scenarios also accept `-cache-perf-expiry-measure=latency` or
+`reclaim` to run only one measurement; the default `both` keeps the original
+two-fixture measurement. See [performance modes](performance/README.md).
+
+The performance CLI and quick collection scripts have a separate integration
+check using Python 3's standard library and real Go subprocesses:
+
+```sh
+python3 scripts/test-perf.py
+```
+
+It checks all expiry measurement modes, quick JSON accounting, refusal to
+overwrite evidence, and the three AB/BA comparison pairs in a temporary git
+repository. It does not alter the developer's commits or refs and is kept
+outside ordinary `go test` so routine correctness checks do not run stress
+collection.
+
+To replay a recorded history or model failure, rerun with `-run` naming the
+failing test and the seed or shuffle seed Go printed; scenario JSON records
+carry the seed and workload SHA256 next to every measurement.
 
 The race detector requires a supported platform and a C toolchain. Use a shuffle
 seed printed by Go to replay ordering; use `-run` to isolate a regression. Fuzz
@@ -55,7 +128,12 @@ report observations rather than imposing machine-dependent latency thresholds.
 Statement coverage measures executed code; race/model/behavior checks are still
 required and cannot be replaced by a coverage percentage.
 
-CI runs vet, tests, and shuffled race checks on Go 1.18/Linux and stable Go on
-Linux, macOS, and Windows. Stable Linux also checks formatting, coverage, and
-fuzzing. Actions are pinned to immutable commits. Remote CI results require an
-actual GitHub run; writing the workflow does not establish those results.
+CI runs a separate golangci-lint job on stable Go/Linux for every push and pull
+request, with the tool version pinned to v2.15.0. CI also runs vet, tests, and
+shuffled race checks on Go 1.18/Linux and stable Go on
+Linux, macOS, and Windows. Every matrix entry therefore runs the real
+cleaner/timer and lifecycle tests; the Go 1.18 entry is the old-timer-semantics
+gate. Stable Linux also checks formatting, coverage, and fuzzing. Actions are
+pinned to immutable commits. Cross-compiling or merely having the workflow file
+is not evidence: remote CI results require an actual GitHub run, and results on
+platforms this machine cannot execute stay unverified until such a run exists.
